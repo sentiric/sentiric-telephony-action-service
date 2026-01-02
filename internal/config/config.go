@@ -1,4 +1,3 @@
-// sentiric-telephony-action-service/internal/config/config.go
 package config
 
 import (
@@ -17,17 +16,16 @@ type Config struct {
 	LogLevel string
 	Env      string
 
-	// Telephony Action Service bağımlılıkları (Placeholder)
 	MediaServiceURL     string
 	TtsGatewayURL       string
-	MessagingGatewayURL string
+	SttGatewayURL       string // YENİ
+	DialogServiceURL    string // YENİ
 	SipSignalingURL     string
 }
 
 func Load() (*Config, error) {
 	godotenv.Load()
 
-	// Harmonik Mimari Portlar (Agent ile aynı katman, 131XX bloğu atandı)
 	return &Config{
 		GRPCPort: GetEnv("TELEPHONY_ACTION_SERVICE_GRPC_PORT", "13111"),
 		HttpPort: GetEnv("TELEPHONY_ACTION_SERVICE_HTTP_PORT", "13110"),
@@ -40,7 +38,8 @@ func Load() (*Config, error) {
 
 		MediaServiceURL:     GetEnv("MEDIA_SERVICE_TARGET_GRPC_URL", "media-service:13031"),
 		TtsGatewayURL:       GetEnv("TTS_GATEWAY_TARGET_GRPC_URL", "tts-gateway:14011"),
-		MessagingGatewayURL: GetEnv("MESSAGING_GATEWAY_TARGET_GRPC_URL", "messaging-gateway:18021"),
+		SttGatewayURL:       GetEnv("STT_GATEWAY_TARGET_GRPC_URL", "stt-gateway:15021"),
+		DialogServiceURL:    GetEnv("DIALOG_SERVICE_TARGET_GRPC_URL", "dialog-service:12061"),
 		SipSignalingURL:     GetEnv("SIP_SIGNALING_TARGET_GRPC_URL", "sip-signaling:13021"),
 	}, nil
 }
