@@ -1,81 +1,98 @@
 package client
 
 import (
-	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
 	"os"
 	"strings"
-	"time"
 
-	"github.com/sentiric/sentiric-telephony-action-service/internal/config"
+	"github.com/rs/zerolog/log"
 	dialogv1 "github.com/sentiric/sentiric-contracts/gen/go/sentiric/dialog/v1"
 	mediav1 "github.com/sentiric/sentiric-contracts/gen/go/sentiric/media/v1"
+	sipv1 "github.com/sentiric/sentiric-contracts/gen/go/sentiric/sip/v1"
 	sttv1 "github.com/sentiric/sentiric-contracts/gen/go/sentiric/stt/v1"
 	ttsv1 "github.com/sentiric/sentiric-contracts/gen/go/sentiric/tts/v1"
-	sipv1 "github.com/sentiric/sentiric-contracts/gen/go/sentiric/sip/v1"
+	"github.com/sentiric/sentiric-telephony-action-service/internal/config"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/credentials/insecure"
 )
 
 type Clients struct {
-	Media    mediav1.MediaServiceClient
-	STT      sttv1.SttGatewayServiceClient
-	Dialog   dialogv1.DialogServiceClient
-	TTS      ttsv1.TtsGatewayServiceClient
+	Media     mediav1.MediaServiceClient
+	STT       sttv1.SttGatewayServiceClient
+	Dialog    dialogv1.DialogServiceClient
+	TTS       ttsv1.TtsGatewayServiceClient
 	Signaling sipv1.SipSignalingServiceClient
 }
 
 func NewClients(cfg *config.Config) (*Clients, error) {
-	mediaConn, err := createSecureConnection(cfg, cfg.MediaServiceURL)
-	if err != nil { return nil, fmt.Errorf("media service connection failed: %w", err) }
+	log.Info().Msg("🔌 Alt servislere bağlantılar kuruluyor...")
 
-	sttConn, err := createSecureConnection(cfg, cfg.SttGatewayURL) // Config'e eklenmeli
-	if err != nil { return nil, fmt.Errorf("stt gateway connection failed: %w", err) }
-
-	dialogConn, err := createSecureConnection(cfg, cfg.DialogServiceURL) // Config'e eklenmeli
-	if err != nil { return nil, fmt.Errorf("dialog service connection failed: %w", err) }
-
-	ttsConn, err := createSecureConnection(cfg, cfg.TtsGatewayURL)
-	if err != nil { return nil, fmt.Errorf("tts gateway connection failed: %w", err) }
+	// Lazy connection: Bağlantılar ilk istekte kurulur.
+	mediaConn, err := createConnection(cfg, cfg.MediaServiceURL)
+	if err != nil { return nil, err }
 	
-	sipConn, err := createSecureConnection(cfg, cfg.SipSignalingURL)
-	if err != nil { return nil, fmt.Errorf("sip signaling connection failed: %w", err) }
+	sttConn, err := createConnection(cfg, cfg.SttGatewayURL)
+	if err != nil { return nil, err }
+	
+	dialogConn, err := createConnection(cfg, cfg.DialogServiceURL)
+	if err != nil { return nil, err }
+	
+	ttsConn, err := createConnection(cfg, cfg.TtsGatewayURL)
+	if err != nil { return nil, err }
+	
+	sipConn, err := createConnection(cfg, cfg.SipSignalingURL)
+	if err != nil { return nil, err }
+
+	log.Info().Msg("✅ Tüm gRPC istemcileri yapılandırıldı (Lazy Connect).")
 
 	return &Clients{
-		Media:    mediav1.NewMediaServiceClient(mediaConn),
-		STT:      sttv1.NewSttGatewayServiceClient(sttConn),
-		Dialog:   dialogv1.NewDialogServiceClient(dialogConn),
-		TTS:      ttsv1.NewTtsGatewayServiceClient(ttsConn),
+		Media:     mediav1.NewMediaServiceClient(mediaConn),
+		STT:       sttv1.NewSttGatewayServiceClient(sttConn),
+		Dialog:    dialogv1.NewDialogServiceClient(dialogConn),
+		TTS:       ttsv1.NewTtsGatewayServiceClient(ttsConn),
 		Signaling: sipv1.NewSipSignalingServiceClient(sipConn),
 	}, nil
 }
 
-func createSecureConnection(cfg *config.Config, targetURL string) (*grpc.ClientConn, error) {
-	clientCert, err := tls.LoadX509KeyPair(cfg.CertPath, cfg.KeyPath)
-	if err != nil {
-		return nil, fmt.Errorf("client cert error: %w", err)
+func createConnection(cfg *config.Config, targetURL string) (*grpc.ClientConn, error) {
+	var opts []grpc.DialOption
+
+	// mTLS Kontrolü
+	if cfg.CertPath != "" && cfg.KeyPath != "" && cfg.CaPath != "" {
+		// Dosyaların varlığını kontrol et
+		if _, err := os.Stat(cfg.CertPath); os.IsNotExist(err) {
+			log.Warn().Str("path", cfg.CertPath).Msg("Sertifika dosyası bulunamadı, INSECURE moduna geçiliyor.")
+			opts = append(opts, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		} else {
+			clientCert, err := tls.LoadX509KeyPair(cfg.CertPath, cfg.KeyPath)
+			if err != nil {
+				return nil, fmt.Errorf("cert load error: %w", err)
+			}
+			caCert, err := os.ReadFile(cfg.CaPath)
+			if err != nil {
+				return nil, fmt.Errorf("ca load error: %w", err)
+			}
+			caPool := x509.NewCertPool()
+			if !caPool.AppendCertsFromPEM(caCert) {
+				return nil, fmt.Errorf("failed to append CA")
+			}
+
+			serverName := strings.Split(targetURL, ":")[0]
+			creds := credentials.NewTLS(&tls.Config{
+				Certificates: []tls.Certificate{clientCert},
+				RootCAs:      caPool,
+				ServerName:   serverName,
+			})
+			opts = append(opts, grpc.WithTransportCredentials(creds))
+		}
+	} else {
+		log.Warn().Str("target", targetURL).Msg("⚠️ mTLS config eksik, INSECURE bağlanılıyor.")
+		opts = append(opts, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	}
 
-	caCert, err := os.ReadFile(cfg.CaPath)
-	if err != nil {
-		return nil, fmt.Errorf("ca cert error: %w", err)
-	}
-	caPool := x509.NewCertPool()
-	if !caPool.AppendCertsFromPEM(caCert) {
-		return nil, fmt.Errorf("ca cert append error")
-	}
-
-	serverName := strings.Split(targetURL, ":")[0]
-	creds := credentials.NewTLS(&tls.Config{
-		Certificates: []tls.Certificate{clientCert},
-		RootCAs:      caPool,
-		ServerName:   serverName,
-	})
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	return grpc.DialContext(ctx, targetURL, grpc.WithTransportCredentials(creds), grpc.WithBlock())
+	// NewClient non-blocking'dir
+	return grpc.NewClient(targetURL, opts...)
 }

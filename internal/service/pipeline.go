@@ -2,8 +2,10 @@ package service
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"sync"
+    // "time" kaldırıldı
 
 	"github.com/rs/zerolog"
 	"github.com/sentiric/sentiric-telephony-action-service/internal/client"
@@ -23,178 +25,205 @@ func NewPipelineManager(clients *client.Clients, log zerolog.Logger) *PipelineMa
 	return &PipelineManager{clients: clients, log: log}
 }
 
-// RunPipeline: Bir telefon çağrısı için uçtan uca ses döngüsünü başlatır.
+// RunPipeline: Ses döngüsünü başlatır ve yönetir.
 func (pm *PipelineManager) RunPipeline(ctx context.Context, callID, sessionID, userID string, rtpPort uint32) error {
 	log := pm.log.With().Str("call_id", callID).Str("session_id", sessionID).Logger()
-	log.Info().Msg("Telephony Pipeline başlatılıyor...")
+	log.Info().Msg("🚀 Pipeline Başlatılıyor: Media <-> STT <-> Dialog <-> TTS")
 
-	// Context'e TraceID ekle
-	ctx = metadata.AppendToOutgoingContext(ctx, "x-trace-id", sessionID)
+	// 1. Metadata (TraceID) Hazırla
+	md := metadata.Pairs("x-trace-id", sessionID)
+	outCtx := metadata.NewOutgoingContext(ctx, md)
 
-	// 1. STT Stream Başlat
-	sttStream, err := pm.clients.STT.TranscribeStream(ctx)
-	if err != nil {
-		return pm.logError(err, "STT stream başlatılamadı")
+	// -------------------------------------------------------------------------
+	// ADIM 1: TÜM BAĞLANTILARI AÇ (STREAM SETUP)
+	// -------------------------------------------------------------------------
+
+	// A. Media Record (Kulak)
+	mediaRecStream, err := pm.clients.Media.RecordAudio(outCtx, &mediav1.RecordAudioRequest{
+		ServerRtpPort: rtpPort,
+		TargetSampleRate: nil, // Default 16000
+	})
+	if err != nil { return fmt.Errorf("media record stream failed: %w", err) }
+
+	// B. Media Playback (Ağız)
+	mediaPlayStream, err := pm.clients.Media.StreamAudioToCall(outCtx)
+	if err != nil { return fmt.Errorf("media play stream failed: %w", err) }
+	// Handshake: Call ID'yi bildir
+	if err := mediaPlayStream.Send(&mediav1.StreamAudioToCallRequest{CallId: callID}); err != nil {
+		return fmt.Errorf("media play handshake failed: %w", err)
 	}
 
-	// 2. Dialog Stream Başlat
-	dialogStream, err := pm.clients.Dialog.StreamConversation(ctx)
-	if err != nil {
-		return pm.logError(err, "Dialog stream başlatılamadı")
-	}
-	// Dialog Config Gönder
+	// C. STT (Kulak -> Metin)
+	sttStream, err := pm.clients.STT.TranscribeStream(outCtx)
+	if err != nil { return fmt.Errorf("stt stream failed: %w", err) }
+
+	// D. Dialog (Beyin)
+	dialogStream, err := pm.clients.Dialog.StreamConversation(outCtx)
+	if err != nil { return fmt.Errorf("dialog stream failed: %w", err) }
+	// Handshake: Session Config
 	if err := dialogStream.Send(&dialogv1.StreamConversationRequest{
 		Payload: &dialogv1.StreamConversationRequest_Config{
 			Config: &dialogv1.ConversationConfig{SessionId: sessionID, UserId: userID},
 		},
-	}); err != nil {
-		return pm.logError(err, "Dialog config gönderilemedi")
-	}
+	}); err != nil { return fmt.Errorf("dialog config failed: %w", err) }
 
-	// 3. Media Input Stream (Kulak) Başlat
-	// Media Service'ten gelen RTP paketlerini dinle
-	mediaRecStream, err := pm.clients.Media.RecordAudio(ctx, &mediav1.RecordAudioRequest{
-		ServerRtpPort: rtpPort,
-		TargetSampleRate: nil, // Default 16k
-	})
-	if err != nil {
-		return pm.logError(err, "Media record stream başlatılamadı")
-	}
+	log.Info().Msg("✅ Tüm stream bağlantıları kuruldu. Veri akışı başlıyor.")
 
-	// 4. Media Output Stream (Ağız) Başlat
-	// TTS'ten gelen sesi Media Service'e basmak için
-	mediaPlayStream, err := pm.clients.Media.StreamAudioToCall(ctx)
-	if err != nil {
-		return pm.logError(err, "Media playback stream başlatılamadı")
-	}
-	// İlk mesajda CallID gönder
-	if err := mediaPlayStream.Send(&mediav1.StreamAudioToCallRequest{CallId: callID}); err != nil {
-		return pm.logError(err, "Media playback handshake başarısız")
-	}
-
-	// --- KOORDİNASYON KANALLARI ---
-	// Söz kesme (Interruption) sinyali için
-	interruptChan := make(chan bool, 1)
+	// -------------------------------------------------------------------------
+	// ADIM 2: KOORDİNASYON VE SÖZ KESME MEKANİZMASI
+	// -------------------------------------------------------------------------
 	
+	// Interruption kontrolü için
+	var ttsCancelFunc context.CancelFunc
+	var ttsMutex sync.Mutex
+
+	// Hata yakalama
+	errChan := make(chan error, 10)
+	// Alt rutinleri beklemek için
 	var wg sync.WaitGroup
 
-	// GÖREV A: Ses Taşıma (Media -> STT)
+	// Pipeline'ın genel iptali için context
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	// -------------------------------------------------------------------------
+	// ADIM 3: GOROUTINE'LER (PARALEL GÖREVLER)
+	// -------------------------------------------------------------------------
+
+	// TASK 1: Media -> STT (Sesi Taşı)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
+		defer sttStream.CloseSend()
+		log.Debug().Msg("Task 1 Başladı: Media -> STT")
+		
 		for {
 			chunk, err := mediaRecStream.Recv()
-			if err == io.EOF || err != nil {
-				log.Warn().Err(err).Msg("Media input kesildi")
-				sttStream.CloseSend()
-				return
-			}
+			if err == io.EOF { return }
+			if err != nil { errChan <- fmt.Errorf("media recv: %w", err); return }
+
 			// STT'ye gönder
 			if err := sttStream.Send(&sttv1.TranscribeStreamRequest{AudioChunk: chunk.AudioData}); err != nil {
-				log.Error().Err(err).Msg("STT send error")
+				errChan <- fmt.Errorf("stt send: %w", err)
 				return
 			}
 		}
 	}()
 
-	// GÖREV B: STT Sonuçlarını İşle (STT -> Dialog & Interruption)
+	// TASK 2: STT -> Dialog (Metni Taşı ve Söz Kesmeyi Yönet)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
+		log.Debug().Msg("Task 2 Başladı: STT -> Dialog")
+		
 		for {
 			res, err := sttStream.Recv()
-			if err == io.EOF || err != nil {
-				log.Warn().Err(err).Msg("STT output kesildi")
-				return
-			}
+			if err == io.EOF { return }
+			if err != nil { errChan <- fmt.Errorf("stt recv: %w", err); return }
 
-			// Eğer kullanıcı konuşuyorsa (Partial result bile olsa), TTS'i sustur
-			if len(res.PartialTranscription) > 5 { // Gürültü filtresi
-				select {
-				case interruptChan <- true:
-					log.Debug().Msg("🗣️ Söz kesme algılandı (Interruption)")
-				default:
+			// INTERRUPTION LOGIC
+			// Eğer kullanıcı konuşuyorsa (Partial result) ve henüz final değilse:
+			// Mevcut TTS'i sustur.
+			if !res.IsFinal && len(res.PartialTranscription) > 2 {
+				ttsMutex.Lock()
+				if ttsCancelFunc != nil {
+					log.Warn().Str("input", res.PartialTranscription).Msg("🛑 SÖZ KESME: TTS Durduruluyor.")
+					ttsCancelFunc() // Mevcut TTS işlemini iptal et
+					ttsCancelFunc = nil
 				}
+				ttsMutex.Unlock()
 			}
 
 			if res.IsFinal {
-				log.Info().Str("text", res.PartialTranscription).Msg("👤 Kullanıcı (STT Final)")
+				log.Info().Str("user_text", res.PartialTranscription).Msg("🗣️ Kullanıcı")
 				
-				// Dialog'a metni gönder
-				dialogStream.Send(&dialogv1.StreamConversationRequest{
+				// Dialog'a ilet
+				if err := dialogStream.Send(&dialogv1.StreamConversationRequest{
 					Payload: &dialogv1.StreamConversationRequest_TextInput{TextInput: res.PartialTranscription},
-				})
-				// Final olduğunu bildir (Dialog LLM'e sorsun)
-				dialogStream.Send(&dialogv1.StreamConversationRequest{
+				}); err != nil { errChan <- err; return }
+
+				if err := dialogStream.Send(&dialogv1.StreamConversationRequest{
 					Payload: &dialogv1.StreamConversationRequest_IsFinalInput{IsFinalInput: true},
-				})
+				}); err != nil { errChan <- err; return }
 			}
 		}
 	}()
 
-	// GÖREV C: Dialog -> TTS (Metin Gelince Sese Çevir)
-	// Bu kısım biraz karmaşık: Her cümle için yeni bir TTS stream'i açmak gerekebilir
-	// veya TTS Gateway tek stream üzerinden çalışıyorsa ona göre ayarlanmalı.
-	// Şimdilik sırayla işliyoruz.
+	// TASK 3: Dialog -> TTS (Metni Sese Çevir)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		
-		// TTS Streaming için kuyruk (Sıralı konuşma)
-		// Basitlik için her gelen metni anında TTS'e gönderiyoruz
-		// Interruption geldiğinde bu döngü içindeki TTS işlemi iptal edilmeli (Gelişmiş versiyonda)
-		
+		log.Debug().Msg("Task 3 Başladı: Dialog -> TTS")
+
 		for {
 			dRes, err := dialogStream.Recv()
-			if err == io.EOF || err != nil { return }
+			if err == io.EOF { return }
+			if err != nil { errChan <- fmt.Errorf("dialog recv: %w", err); return }
 
-			if text := dRes.GetTextResponse(); text != "" {
-				log.Info().Str("text", text).Msg("🤖 AI Yanıtı")
+			text := dRes.GetTextResponse()
+			if text != "" {
+				log.Info().Str("ai_text", text).Msg("🤖 AI")
+
+				// Yeni TTS Context oluştur (İptal edilebilir)
+				ttsCtx, tCancel := context.WithCancel(outCtx)
 				
-				// TTS İsteği (Stream)
-				ttsReq := &ttsv1.SynthesizeStreamRequest{
-					Text: text,
-					VoiceId: "coqui:default", // Config'den gelmeli
-					TextType: ttsv1.TextType_TEXT_TYPE_TEXT,
-					AudioConfig: &ttsv1.AudioConfig{SampleRateHertz: 8000, AudioFormat: ttsv1.AudioFormat_AUDIO_FORMAT_PCM_S16LE},
-				}
+				ttsMutex.Lock()
+				if ttsCancelFunc != nil { ttsCancelFunc() } // Önceki varsa kapat
+				ttsCancelFunc = tCancel
+				ttsMutex.Unlock()
+
+				// TTS işlemini bloklamadan (asenkron değil, stream içinde sıralı) yapmalıyız
+				// Basitlik için burada bloklayarak gönderiyoruz (Cümle cümle).
 				
-				ttsStream, err := pm.clients.TTS.SynthesizeStream(ctx, ttsReq)
-				if err != nil {
-					log.Error().Err(err).Msg("TTS stream başlatılamadı")
-					continue
-				}
-
-				// TTS -> Media
-				for {
-					// Interruption kontrolü
-					select {
-					case <-interruptChan:
-						log.Warn().Msg("⛔ TTS susturuldu (Interruption)")
-						goto NEXT_TURN // TTS döngüsünü kır, sonraki Dialog mesajına geç
-					default:
-					}
-
-					chunk, err := ttsStream.Recv()
-					if err == io.EOF { break }
-					if err != nil { break }
-
-					// Media Service'e gönder
-					if err := mediaPlayStream.Send(&mediav1.StreamAudioToCallRequest{AudioChunk: chunk.AudioContent}); err != nil {
-						log.Error().Err(err).Msg("Media play error")
-						return
+				if err := pm.streamTTS(ttsCtx, text, mediaPlayStream); err != nil {
+					// İptal hatası normaldir (Söz kesme)
+					if err != context.Canceled {
+						log.Error().Err(err).Msg("TTS Stream Hatası")
 					}
 				}
-				NEXT_TURN:
 			}
 		}
 	}()
 
-	wg.Wait()
+	// Hata veya Bitiş Bekle
+	select {
+	case <-ctx.Done():
+		log.Info().Msg("Pipeline kapatılıyor.")
+	case err := <-errChan:
+		log.Error().Err(err).Msg("Pipeline kritik hata ile sonlandı.")
+		return err
+	}
+	
 	return nil
 }
 
-func (pm *PipelineManager) logError(err error, msg string) error {
-	pm.log.Error().Err(err).Msg(msg)
-	return err
+// streamTTS: Metni TTS servisine gönderir ve gelen sesi Media servisine basar.
+func (pm *PipelineManager) streamTTS(
+	ctx context.Context, 
+	text string, 
+	mediaStream mediav1.MediaService_StreamAudioToCallClient,
+) error {
+	
+	ttsReq := &ttsv1.SynthesizeStreamRequest{
+		Text: text,
+		VoiceId: "coqui:default",
+		TextType: ttsv1.TextType_TEXT_TYPE_TEXT,
+		AudioConfig: &ttsv1.AudioConfig{
+			SampleRateHertz: 8000, 
+			AudioFormat: ttsv1.AudioFormat_AUDIO_FORMAT_PCM_S16LE,
+		},
+	}
+
+	ttsStream, err := pm.clients.TTS.SynthesizeStream(ctx, ttsReq)
+	if err != nil { return err }
+
+	for {
+		chunk, err := ttsStream.Recv()
+		if err == io.EOF { return nil }
+		if err != nil { return err }
+
+		if err := mediaStream.Send(&mediav1.StreamAudioToCallRequest{AudioChunk: chunk.AudioContent}); err != nil {
+			return err
+		}
+	}
 }

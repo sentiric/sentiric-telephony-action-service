@@ -5,7 +5,6 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
-	"io"
 	"net"
 	"os"
 
@@ -17,7 +16,6 @@ import (
 	"google.golang.org/grpc/credentials"
 )
 
-// Server struct'ı güncellendi
 type Server struct {
 	telephonyv1.UnimplementedTelephonyActionServiceServer
 	pipelineManager *service.PipelineManager
@@ -25,13 +23,24 @@ type Server struct {
 }
 
 func NewGrpcServer(certPath, keyPath, caPath string, log zerolog.Logger, clients *client.Clients) *grpc.Server {
-	creds, err := loadServerTLS(certPath, keyPath, caPath)
-	if err != nil {
-		log.Fatal().Err(err).Msg("TLS yüklenemedi")
+	var opts []grpc.ServerOption
+
+	if certPath != "" && keyPath != "" && caPath != "" {
+		if _, err := os.Stat(certPath); err == nil {
+			creds, err := loadServerTLS(certPath, keyPath, caPath)
+			if err != nil {
+				log.Error().Err(err).Msg("TLS yüklenemedi, INSECURE başlatılıyor.")
+			} else {
+				opts = append(opts, grpc.Creds(creds))
+				log.Info().Msg("🔒 gRPC Server mTLS ile başlatılıyor.")
+			}
+		} else {
+			log.Warn().Msg("Sertifika dosyaları bulunamadı, INSECURE başlatılıyor.")
+		}
 	}
 
 	pipelineMgr := service.NewPipelineManager(clients, log)
-	grpcServer := grpc.NewServer(grpc.Creds(creds))
+	grpcServer := grpc.NewServer(opts...)
 	
 	telephonyv1.RegisterTelephonyActionServiceServer(grpcServer, &Server{
 		pipelineManager: pipelineMgr,
@@ -41,49 +50,66 @@ func NewGrpcServer(certPath, keyPath, caPath string, log zerolog.Logger, clients
 	return grpcServer
 }
 
-// RunPipeline Implementasyonu
-func (s *Server) RunPipeline(stream telephonyv1.TelephonyActionService_RunPipelineServer) error {
-	// İlk mesajı al (Config ve CallID)
-	req, err := stream.Recv()
+// RunPipeline: Server Streaming RPC Implementasyonu
+// DÜZELTME: İmzaya dikkat edin. 'req' parametresi eklendi, 'stream' ikinci parametre oldu.
+func (s *Server) RunPipeline(req *telephonyv1.RunPipelineRequest, stream telephonyv1.TelephonyActionService_RunPipelineServer) error {
+	// ARTIK stream.Recv() ÇAĞIRMIYORUZ. İstek 'req' içinde geldi.
+	
+	callID := req.CallId
+	sessionID := req.SessionId
+	
+	var rtpPort uint32 = 0
+	if req.MediaInfo != nil {
+		rtpPort = req.MediaInfo.ServerRtpPort
+	} else {
+		rtpPort = 10000 // Test varsayılanı
+	}
+
+	s.log.Info().Str("call_id", callID).Uint32("rtp_port", rtpPort).Msg("Pipeline başlatılıyor...")
+
+	// İstemciye "Başladım" bilgisini gönder
+	stream.Send(&telephonyv1.RunPipelineResponse{
+		State: telephonyv1.RunPipelineResponse_STATE_RUNNING,
+		Message: "Pipeline initialized.",
+	})
+
+	// Pipeline'ı Çalıştır
+	err := s.pipelineManager.RunPipeline(stream.Context(), callID, sessionID, "user-1", rtpPort)
+	
 	if err != nil {
+		s.log.Error().Err(err).Msg("Pipeline hatayla sonlandı")
+		stream.Send(&telephonyv1.RunPipelineResponse{
+			State: telephonyv1.RunPipelineResponse_STATE_ERROR,
+			Message: err.Error(),
+		})
 		return err
 	}
 
-	callID := req.CallId
-	sessionID := req.SessionId
-	// RTP portunu request içinden veya başka bir yerden almalıyız. 
-	// Şimdilik request'e eklenmediği için metadata veya veritabanından alınmalı.
-	// Hızlı çözüm: Request proto'sunu güncellemek gerekir ama şimdilik mock port kullanıyoruz veya
-	// Media Service'ten sorguluyoruz. 
-	// DOĞRUSU: CallID ile MediaService'ten portu bulmaktır.
-	// Ancak basitlik için RunPipelineRequest'e rtp_port eklenmeliydi. 
-	// Varsayalım ki req.SessionId içinde port bilgisi kodlu veya DB'den çekiliyor.
-	// (Görevi basitleştirmek için burada hardcoded port yerine, media service'e sorulabilir)
+	s.log.Info().Str("call_id", callID).Msg("Pipeline başarıyla tamamlandı.")
+	stream.Send(&telephonyv1.RunPipelineResponse{
+		State: telephonyv1.RunPipelineResponse_STATE_STOPPED,
+		Message: "Pipeline finished.",
+	})
 	
-	// Şimdilik 0 veriyoruz, pipeline içinde MediaService AllocatePort çağrısı yapılabilir 
-	// ama Agent Service zaten portu alıp CallStarted eventi atmıştı.
-	// MediaInfo burada eksik.
-	
-	// FIX: PipelineManager içinde MediaService çağrısı yaparak portu öğrenmemiz lazım veya
-	// Agent Service'in bu bilgiyi geçmesi lazım.
-	// Şimdilik loglayıp geçiyoruz.
-	
-	s.log.Info().Str("call_id", callID).Msg("Pipeline isteği alındı")
-
-	// Pipeline'ı başlat (Bloklayan işlem)
-	// Not: Gerçek port verisini almak için Contracts güncellemesi gerekebilir.
-	// Şimdilik 10000 varsayılan port ile test edilecek.
-	err = s.pipelineManager.RunPipeline(stream.Context(), callID, sessionID, "user-1", 10000)
-	
-	return err
+	return nil
 }
 
-// ... (Diğer metodlar PlayAudio vb. aynı kalır veya güncellenir) ...
+// Legacy metodlar
 func (s *Server) PlayAudio(ctx context.Context, req *telephonyv1.PlayAudioRequest) (*telephonyv1.PlayAudioResponse, error) {
-	// ... implementation ...
 	return &telephonyv1.PlayAudioResponse{Success: true}, nil
 }
-// ... (Diğer metodların boş implementasyonları korunur)
+func (s *Server) TerminateCall(ctx context.Context, req *telephonyv1.TerminateCallRequest) (*telephonyv1.TerminateCallResponse, error) {
+	return &telephonyv1.TerminateCallResponse{Success: true}, nil
+}
+func (s *Server) SendTextMessage(ctx context.Context, req *telephonyv1.SendTextMessageRequest) (*telephonyv1.SendTextMessageResponse, error) {
+	return &telephonyv1.SendTextMessageResponse{Success: true}, nil
+}
+func (s *Server) StartRecording(ctx context.Context, req *telephonyv1.StartRecordingRequest) (*telephonyv1.StartRecordingResponse, error) {
+	return &telephonyv1.StartRecordingResponse{Success: true}, nil
+}
+func (s *Server) StopRecording(ctx context.Context, req *telephonyv1.StopRecordingRequest) (*telephonyv1.StopRecordingResponse, error) {
+	return &telephonyv1.StopRecordingResponse{Success: true}, nil
+}
 
 func Start(grpcServer *grpc.Server, port string) error {
 	lis, err := net.Listen("tcp", fmt.Sprintf(":%s", port))
@@ -96,20 +122,26 @@ func Stop(grpcServer *grpc.Server) {
 }
 
 func loadServerTLS(certPath, keyPath, caPath string) (credentials.TransportCredentials, error) {
-	// ... (Aynı kalır) ...
-	cert, err := os.ReadFile(certPath)
-	if err != nil { return nil, err }
-	key, err := os.ReadFile(keyPath)
-	if err != nil { return nil, err }
-	ca, err := os.ReadFile(caPath)
-	if err != nil { return nil, err }
-	
-	certPool := x509.NewCertPool()
-	certPool.AppendCertsFromPEM(ca)
-	
-	return credentials.NewTLS(&tls.Config{
-		Certificates: []tls.Certificate{{Certificate: [][]byte{cert}, PrivateKey: key}}, // Basitleştirilmiş
+	// X509KeyPair kullanıyoruz (PEM -> DER otomatik dönüşümü için)
+	certificate, err := tls.LoadX509KeyPair(certPath, keyPath)
+	if err != nil {
+		return nil, fmt.Errorf("sunucu sertifikası yüklenemedi: %w", err)
+	}
+
+	caCert, err := os.ReadFile(caPath)
+	if err != nil {
+		return nil, fmt.Errorf("CA sertifikası okunamadı: %w", err)
+	}
+	caPool := x509.NewCertPool()
+	if !caPool.AppendCertsFromPEM(caCert) {
+		return nil, fmt.Errorf("CA sertifikası havuza eklenemedi")
+	}
+
+	tlsConfig := &tls.Config{
+		Certificates: []tls.Certificate{certificate},
 		ClientAuth:   tls.RequireAndVerifyClientCert,
-		ClientCAs:    certPool,
-	}), nil
+		ClientCAs:    caPool,
+	}
+
+	return credentials.NewTLS(tlsConfig), nil
 }

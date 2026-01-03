@@ -21,8 +21,8 @@ github.com/pkg/errors v0.9.1/go.mod h1:bwawxfHBFNV+L2hUp1rHADufV3IMtnDRdf1r5NINE
 github.com/rs/xid v1.6.0/go.mod h1:7XoLgs4eV+QndskICGsho+ADou8ySMSjJKDIan90Nz0=
 github.com/rs/zerolog v1.34.0 h1:k43nTLIwcTVQAncfCw4KZ2VY6ukYoZaBPNOE8txlOeY=
 github.com/rs/zerolog v1.34.0/go.mod h1:bJsvje4Z08ROH4Nhs5iH600c3IkWhwp44iRc54W6wYQ=
-github.com/sentiric/sentiric-contracts v1.9.0 h1:bGXMEEL7CjQCg0K9TN1IMhD7zURJg5wJRhGYyLyMSV8=
-github.com/sentiric/sentiric-contracts v1.9.0/go.mod h1:pwSFFmPtvEhM0rksZm5qSuU/h3i6EUT2sulq+Nth+Pg=
+github.com/sentiric/sentiric-contracts v1.13.3 h1:h4JQUyvOA37Yer3A2dW4GPhcI82GrRwWAZ0smBpo0MA=
+github.com/sentiric/sentiric-contracts v1.13.3/go.mod h1:pwSFFmPtvEhM0rksZm5qSuU/h3i6EUT2sulq+Nth+Pg=
 go.opentelemetry.io/auto/sdk v1.1.0 h1:cH53jehLUN6UFLY71z+NDOiNJqDdPRaXzTel0sJySYA=
 go.opentelemetry.io/auto/sdk v1.1.0/go.mod h1:3wSPjt5PWp2RhlCcmmOial7AvC4DQqZb7a7wCow3W8A=
 go.opentelemetry.io/otel v1.37.0 h1:9zhNfelUvx0KBfu/gb+ZgeAfAgtWrfHJZcAqFC228wQ=
