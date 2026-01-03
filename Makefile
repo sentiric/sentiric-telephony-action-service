@@ -1,9 +1,6 @@
-.PHONY: setup up down logs test build clean
+.PHONY: up down logs test build clean
 
-setup: ## Ortam dosyasını hazırlar
-	@if [ ! -f .env ]; then cp .env.example .env; echo "✅ .env oluşturuldu."; fi
-
-up: setup ## Servisi başlatır
+up: ## Servisi başlatır
 	docker compose up --build -d
 
 down: ## Servisi durdurur

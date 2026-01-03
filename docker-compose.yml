@@ -22,31 +22,132 @@ networks:
         - subnet: ${NETWORK_SUBNET:-10.88.0.0/16}
           gateway: ${NETWORK_GATEWAY:-10.88.0.1}
 
+volumes:
+  infra-minio-data:
+
+
 services:
+  # =============================================================
+  # 1. TELEPHONY ACTION SERVICE (Hedef Servis)
+  # =============================================================
   telephony-action-service:
     <<: *common-settings
     build:
       context: .
       dockerfile: Dockerfile
     image: ghcr.io/sentiric/sentiric-telephony-action-service:latest
-    container_name: telephony-action-service
-    env_file:
-      - .env
     environment:
-      # --- BURASI DÜZELTİLDİ: DEBUG MODU ZORLANDI ---
+      # --- Identity ---
+      - SERVICE_NAME=sentiric-telephony-action-service
+      - ENV=development
       - LOG_LEVEL=debug
-      - RUST_LOG=debug
+      - SERVICE_VERSION=1.0.0
+
+      # --- Network (Layer: 131xx) ---
+      - TELEPHONY_ACTION_SERVICE_HOST=telephony-action-service
+      - TELEPHONY_ACTION_SERVICE_LISTEN_ADDRESS=0.0.0.0
+      - TELEPHONY_ACTION_SERVICE_HTTP_PORT=13110
+      - TELEPHONY_ACTION_SERVICE_GRPC_PORT=13111
+      - TELEPHONY_ACTION_SERVICE_METRICS_PORT=13112
+      - TELEPHONY_ACTION_SERVICE_IPV4_ADDRESS=10.88.30.10
+
+      # --- Security (mTLS) ---
+      # Sertifika yolları (Container içi yollar)
+      - GRPC_TLS_CA_PATH=/sentiric-certificates/certs/ca.crt
+      - TELEPHONY_ACTION_SERVICE_CERT_PATH=/sentiric-certificates/certs/telephony-action-service-chain.crt
+      - TELEPHONY_ACTION_SERVICE_KEY_PATH=/sentiric-certificates/certs/telephony-action-service.key
+
+      # --- Upstream Services (Targets) ---
+      # Media Service (RTP/Audio IO)
+      - MEDIA_SERVICE_TARGET_GRPC_URL=media-service:13031
+
+      # AI Gateways
+      - STT_GATEWAY_TARGET_GRPC_URL=stt-gateway-service:15021
+      - TTS_GATEWAY_TARGET_GRPC_URL=tts-gateway-service:14011
+      - DIALOG_SERVICE_TARGET_GRPC_URL=dialog-service:12061
+
+      # Signaling (Termination)
+      - SIP_SIGNALING_TARGET_GRPC_URL=sip-signaling-service:13021
+
     volumes:
       - "${CERTIFICATES_REPO_PATH:-../sentiric-certificates}:/sentiric-certificates:ro"
     ports:
-      - "13110:13110" # HTTP
-      - "13111:13111" # gRPC
-      - "13112:13112" # Metrics
+      - "13110:13110"
+      - "13111:13111"
     networks:
       sentiric-net:
         ipv4_address: 10.88.30.10
     healthcheck:
-      test: ["CMD", "nc", "-z", "localhost", "13111"]
+      test: [ "CMD", "nc", "-z", "localhost", "13111" ]
       interval: 10s
       timeout: 5s
+      retries: 5
+    depends_on:
+      media-service:
+        condition: service_started
+
+  # =============================================================
+  # 2. MEDIA SERVICE (Bağımlılık)
+  # =============================================================
+  media-service:
+    <<: *common-settings
+    # Local build kullanıyoruz ki en güncel hali olsun
+    build:
+      context: ../sentiric-media-service
+      dockerfile: Dockerfile
+    image: ghcr.io/sentiric/sentiric-media-service:latest
+    container_name: media-service
+    volumes:
+      - "${CERTIFICATES_REPO_PATH:-../sentiric-certificates}:/sentiric-certificates:ro"
+      - "${ASSETS_REPO_PATH:-../sentiric-assets}:/sentiric-assets:ro"
+    environment:
+      - ENV=development
+      - RUST_LOG=info,sentiric_media_service=debug
+      - MEDIA_SERVICE_GRPC_PORT=13031
+      - MEDIA_SERVICE_METRICS_PORT=13032
+      - RTP_SERVICE_LISTEN_ADDRESS=0.0.0.0
+      - RTP_SERVICE_PORT_MIN=10000
+      - RTP_SERVICE_PORT_MAX=10100
+      - ASSETS_BASE_PATH=/sentiric-assets
+      # Security
+      - GRPC_TLS_CA_PATH=/sentiric-certificates/certs/ca.crt
+      - MEDIA_SERVICE_CERT_PATH=/sentiric-certificates/certs/media-service-chain.crt
+      - MEDIA_SERVICE_KEY_PATH=/sentiric-certificates/certs/media-service.key
+      # S3 (MinIO)
+      - BUCKET_ENDPOINT_URL=http://minio:9000
+      - BUCKET_REGION=auto
+      - BUCKET_NAME=sentiric
+      - BUCKET_ACCESS_KEY_ID=sentiric
+      - BUCKET_SECRET_ACCESS_KEY=sentiric-secret-key
+    ports:
+      - "13031:13031"
+      - "10000-10100:10000-10100/udp"
+    networks:
+      sentiric-net:
+        ipv4_address: 10.88.30.3
+    depends_on:
+      minio:
+        condition: service_healthy
+
+  # =============================================================
+  # 3. ALTYAPI (MinIO - Media Service için Zorunlu)
+  # =============================================================
+  minio:
+    <<: *common-settings
+    image: ghcr.io/sentiric/sentiric-minio:latest
+    container_name: minio
+    environment:
+      - MINIO_ROOT_USER=sentiric
+      - MINIO_ROOT_PASSWORD=sentiric-secret-key
+    volumes:
+      - infra-minio-data:/data
+    networks:
+      sentiric-net:
+        ipv4_address: 10.88.10.5
+    ports:
+      - "9000:9000"
+    command: server /data --console-address ":9001"
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:9000/minio/health/ready" ]
+      interval: 5s
       retries: 5
