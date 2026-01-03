@@ -28,8 +28,8 @@ func Load() (*Config, error) {
 	godotenv.Load() // .env varsa yükle
 
 	return &Config{
-		GRPCPort: GetEnv("TELEPHONY_ACTION_SERVICE_GRPC_PORT", "13111"),
-		HttpPort: GetEnv("TELEPHONY_ACTION_SERVICE_HTTP_PORT", "13110"),
+		GRPCPort: GetEnv("TELEPHONY_ACTION_SERVICE_GRPC_PORT", "13051"),
+		HttpPort: GetEnv("TELEPHONY_ACTION_SERVICE_HTTP_PORT", "13050"),
 
 		CertPath: GetEnvOrFail("TELEPHONY_ACTION_SERVICE_CERT_PATH"),
 		KeyPath:  GetEnvOrFail("TELEPHONY_ACTION_SERVICE_KEY_PATH"),
