@@ -209,7 +209,10 @@ func (pm *PipelineManager) streamTTS(
 		VoiceId: "coqui:default",
 		TextType: ttsv1.TextType_TEXT_TYPE_TEXT,
 		AudioConfig: &ttsv1.AudioConfig{
-			SampleRateHertz: 8000, 
+            // KRİTİK DÜZELTME: 24000Hz (Coqui Default) yerine 16000Hz istiyoruz.
+            // Bu, media-service tarafında 8kHz'e (G.711) doğru şekilde downsample edilmesini sağlar.
+            // Aksi takdirde ses "slow-motion" (yavaş/kalın) çıkar.
+			SampleRateHertz: 16000, 
 			AudioFormat: ttsv1.AudioFormat_AUDIO_FORMAT_PCM_S16LE,
 		},
 	}
