@@ -226,11 +226,22 @@ func (pm *PipelineManager) streamTTS(
 
 	for {
 		chunk, err := ttsStream.Recv()
-		if err == io.EOF { return nil }
-		if err != nil { return err }
+		if err == io.EOF { 
+            log.Info().Msg("TTS akışı tamamlandı (EOF).")
+            return nil 
+        }
+		if err != nil { 
+            log.Error().Err(err).Msg("TTS akış hatası")
+            return err 
+        }
+
+		// --- YENİ LOG ---
+        log.Debug().Int("bytes", len(chunk.AudioContent)).Msg("TTS chunk alındı, Media'ya gönderiliyor")
 
 		if err := mediaStream.Send(&mediav1.StreamAudioToCallRequest{AudioChunk: chunk.AudioContent}); err != nil {
+            log.Error().Err(err).Msg("Media stream send hatası")
 			return err
 		}
+	
 	}
 }
