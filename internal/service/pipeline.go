@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"io"
 	"sync"
-    // "time" kaldırıldı
 
 	"github.com/rs/zerolog"
 	"github.com/sentiric/sentiric-telephony-action-service/internal/client"
@@ -209,13 +208,10 @@ func (pm *PipelineManager) streamTTS(
 		VoiceId: "coqui:default",
 		TextType: ttsv1.TextType_TEXT_TYPE_TEXT,
 		AudioConfig: &ttsv1.AudioConfig{
-            // KRİTİK DÜZELTME: 24000Hz (Coqui Default) yerine 16000Hz.
-            // Media Service içindeki G.711 encoder'ı 16kHz input bekler.
-            // Bu uyumsuzluk düzeltilince ses hızı normale dönecek.
+            // KRİTİK: 16kHz
 			SampleRateHertz: 16000, 
 			AudioFormat: ttsv1.AudioFormat_AUDIO_FORMAT_PCM_S16LE,
 		},
-        // Hız ayarı (İsteğe bağlı, normal hız için 1.0)
         Prosody: &ttsv1.ProsodyConfig{
             Rate: 1.0,
         },
@@ -227,21 +223,23 @@ func (pm *PipelineManager) streamTTS(
 	for {
 		chunk, err := ttsStream.Recv()
 		if err == io.EOF { 
-            log.Info().Msg("TTS akışı tamamlandı (EOF).")
+            // DÜZELTME: pm.log kullanılıyor
+            pm.log.Info().Msg("TTS akışı tamamlandı (EOF).")
             return nil 
         }
 		if err != nil { 
-            log.Error().Err(err).Msg("TTS akış hatası")
+            // DÜZELTME: pm.log kullanılıyor
+            pm.log.Error().Err(err).Msg("TTS akış hatası")
             return err 
         }
 
-		// --- YENİ LOG ---
-        log.Debug().Int("bytes", len(chunk.AudioContent)).Msg("TTS chunk alındı, Media'ya gönderiliyor")
+        // DÜZELTME: pm.log kullanılıyor
+        pm.log.Debug().Int("bytes", len(chunk.AudioContent)).Msg("TTS chunk alındı, Media'ya gönderiliyor")
 
 		if err := mediaStream.Send(&mediav1.StreamAudioToCallRequest{AudioChunk: chunk.AudioContent}); err != nil {
-            log.Error().Err(err).Msg("Media stream send hatası")
+            // DÜZELTME: pm.log kullanılıyor
+            pm.log.Error().Err(err).Msg("Media stream send hatası")
 			return err
 		}
-	
 	}
 }
