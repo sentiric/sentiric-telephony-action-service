@@ -209,12 +209,16 @@ func (pm *PipelineManager) streamTTS(
 		VoiceId: "coqui:default",
 		TextType: ttsv1.TextType_TEXT_TYPE_TEXT,
 		AudioConfig: &ttsv1.AudioConfig{
-            // KRİTİK DÜZELTME: 24000Hz (Coqui Default) yerine 16000Hz istiyoruz.
-            // Bu, media-service tarafında 8kHz'e (G.711) doğru şekilde downsample edilmesini sağlar.
-            // Aksi takdirde ses "slow-motion" (yavaş/kalın) çıkar.
+            // KRİTİK DÜZELTME: 24000Hz (Coqui Default) yerine 16000Hz.
+            // Media Service içindeki G.711 encoder'ı 16kHz input bekler.
+            // Bu uyumsuzluk düzeltilince ses hızı normale dönecek.
 			SampleRateHertz: 16000, 
 			AudioFormat: ttsv1.AudioFormat_AUDIO_FORMAT_PCM_S16LE,
 		},
+        // Hız ayarı (İsteğe bağlı, normal hız için 1.0)
+        Prosody: &ttsv1.ProsodyConfig{
+            Rate: 1.0,
+        },
 	}
 
 	ttsStream, err := pm.clients.TTS.SynthesizeStream(ctx, ttsReq)
