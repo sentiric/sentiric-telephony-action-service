@@ -57,10 +57,15 @@ func NewGrpcServer(certPath, keyPath, caPath string, log zerolog.Logger, clients
 func (s *Server) SpeakText(ctx context.Context, req *telephonyv1.SpeakTextRequest) (*telephonyv1.SpeakTextResponse, error) {
 	s.log.Info().Str("call_id", req.CallId).Str("text", req.Text).Msg("SpeakText isteği alındı.")
 	
-	// 1. TTS Gateway'den ses al
+	// 1. TTS Gateway'den ses al (Unary)
 	ttsReq := &ttsv1.SynthesizeRequest{
 		Text: req.Text,
 		VoiceId: req.VoiceId,
+		// Varsayılan config
+		AudioConfig: &ttsv1.AudioConfig{
+			SampleRateHertz: 8000,
+			AudioFormat: ttsv1.AudioFormat_AUDIO_FORMAT_PCM_S16LE,
+		},
 	}
 	
 	ttsResp, err := s.pipelineManager.GetClients().TTS.Synthesize(ctx, ttsReq)
@@ -103,20 +108,16 @@ func (s *Server) SpeakText(ctx context.Context, req *telephonyv1.SpeakTextReques
 		}
 	}
 	
-	// [DÜZELTME]: Bi-Directional Stream Kapatma Mantığı
-	// Önce gönderimi kapatıyoruz.
+	// Stream kapat
 	if err := stream.CloseSend(); err != nil {
 		s.log.Error().Err(err).Msg("Stream send kapatılamadı")
 		return nil, err
 	}
 
-	// Sonra sunucudan gelecek olası hata/durum mesajlarını tüketiyoruz.
-	// Media Service hata dönerse burada yakalarız.
+	// Yanıtı bekle
 	for {
 		_, err := stream.Recv()
-		if err == io.EOF {
-			break // Sunucu da kapattı, her şey yolunda.
-		}
+		if err == io.EOF { break }
 		if err != nil {
 			s.log.Error().Err(err).Msg("Media Service stream hatası döndü")
 			return nil, err
@@ -127,7 +128,7 @@ func (s *Server) SpeakText(ctx context.Context, req *telephonyv1.SpeakTextReques
 	return &telephonyv1.SpeakTextResponse{Success: true, Message: "Played"}, nil
 }
 
-// Diğer Legacy metodlar
+// Legacy Metotlar
 func (s *Server) PlayAudio(ctx context.Context, req *telephonyv1.PlayAudioRequest) (*telephonyv1.PlayAudioResponse, error) {
 	return &telephonyv1.PlayAudioResponse{Success: true}, nil
 }
