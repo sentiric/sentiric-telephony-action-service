@@ -25,6 +25,11 @@ func NewPipelineManager(clients *client.Clients, log zerolog.Logger) *PipelineMa
 	return &PipelineManager{clients: clients, log: log}
 }
 
+// GetClients: gRPC handler'ın clientlara erişmesi için getter
+func (pm *PipelineManager) GetClients() *client.Clients {
+	return pm.clients
+}
+
 // RunPipeline: Ses döngüsünü başlatır ve yönetir.
 func (pm *PipelineManager) RunPipeline(ctx context.Context, callID, sessionID, userID string, rtpPort uint32) error {
 	log := pm.log.With().Str("call_id", callID).Str("session_id", sessionID).Logger()
@@ -140,11 +145,9 @@ func (pm *PipelineManager) RunPipeline(ctx context.Context, callID, sessionID, u
 			currentText := sentenceBuffer.String()
 
 			// Cümle Bitiş Kontrolü (Noktalama işaretleri)
-			// Sadece cümlenin sonunda noktalama varsa ve cümle yeterince uzunsa gönder.
 			isSentenceEnd := strings.ContainsAny(token, ".?!:;") || strings.HasSuffix(strings.TrimSpace(currentText), ".")
-			isLongEnough := len(currentText) > 50 // Çok uzun cümleleri beklemeden gönder (latency için)
+			isLongEnough := len(currentText) > 50 
 			
-			// Eğer cümle bittiyse VEYA çok uzadıysa VEYA final sinyali geldiyse
 			shouldFlush := isSentenceEnd || isLongEnough || dRes.GetIsFinalResponse()
 
 			if shouldFlush {

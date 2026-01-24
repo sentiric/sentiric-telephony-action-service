@@ -5,11 +5,14 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
+	"io"
 	"net"
 	"os"
 
 	"github.com/rs/zerolog"
 	telephonyv1 "github.com/sentiric/sentiric-contracts/gen/go/sentiric/telephony/v1"
+	mediav1 "github.com/sentiric/sentiric-contracts/gen/go/sentiric/media/v1"
+	ttsv1 "github.com/sentiric/sentiric-contracts/gen/go/sentiric/tts/v1"
 	"github.com/sentiric/sentiric-telephony-action-service/internal/client"
 	"github.com/sentiric/sentiric-telephony-action-service/internal/service"
 	"google.golang.org/grpc"
@@ -50,53 +53,86 @@ func NewGrpcServer(certPath, keyPath, caPath string, log zerolog.Logger, clients
 	return grpcServer
 }
 
-// RunPipeline: Server Streaming RPC Implementasyonu
-// DÜZELTME: İmzaya dikkat edin. 'req' parametresi eklendi, 'stream' ikinci parametre oldu.
-func (s *Server) RunPipeline(req *telephonyv1.RunPipelineRequest, stream telephonyv1.TelephonyActionService_RunPipelineServer) error {
-	// ARTIK stream.Recv() ÇAĞIRMIYORUZ. İstek 'req' içinde geldi.
+// SpeakText: Metni sese çevirip çalar.
+func (s *Server) SpeakText(ctx context.Context, req *telephonyv1.SpeakTextRequest) (*telephonyv1.SpeakTextResponse, error) {
+	s.log.Info().Str("call_id", req.CallId).Str("text", req.Text).Msg("SpeakText isteği alındı.")
 	
-	callID := req.CallId
-	sessionID := req.SessionId
-	
-	var rtpPort uint32 = 0
-	if req.MediaInfo != nil {
-		rtpPort = req.MediaInfo.ServerRtpPort
-	} else {
-		rtpPort = 10000 // Test varsayılanı
+	// 1. TTS Gateway'den ses al
+	ttsReq := &ttsv1.SynthesizeRequest{
+		Text: req.Text,
+		VoiceId: req.VoiceId,
 	}
-
-	s.log.Info().Str("call_id", callID).Uint32("rtp_port", rtpPort).Msg("Pipeline başlatılıyor...")
-
-	// İstemciye "Başladım" bilgisini gönder
-	stream.Send(&telephonyv1.RunPipelineResponse{
-		State: telephonyv1.RunPipelineResponse_STATE_RUNNING,
-		Message: "Pipeline initialized.",
-	})
-
-	// Pipeline'ı Çalıştır
-	err := s.pipelineManager.RunPipeline(stream.Context(), callID, sessionID, "user-1", rtpPort)
 	
+	ttsResp, err := s.pipelineManager.GetClients().TTS.Synthesize(ctx, ttsReq)
 	if err != nil {
-		s.log.Error().Err(err).Msg("Pipeline hatayla sonlandı")
-		stream.Send(&telephonyv1.RunPipelineResponse{
-			State: telephonyv1.RunPipelineResponse_STATE_ERROR,
-			Message: err.Error(),
-		})
-		return err
+		s.log.Error().Err(err).Msg("TTS sentezleme hatası")
+		return nil, err
+	}
+	
+	s.log.Info().Int("bytes", len(ttsResp.AudioContent)).Msg("TTS sentezi başarılı.")
+
+	// 2. Media Service'e sesi gönder
+	stream, err := s.pipelineManager.GetClients().Media.StreamAudioToCall(ctx)
+	if err != nil {
+		 s.log.Error().Err(err).Msg("Media stream açılamadı")
+		 return nil, err
+	}
+	
+	// İlk mesaj (Call ID ile)
+	if err := stream.Send(&mediav1.StreamAudioToCallRequest{
+		CallId: req.CallId,
+		AudioChunk: nil,
+	}); err != nil {
+		s.log.Error().Err(err).Msg("İlk medya paketi gönderilemedi")
+		return nil, err
+	}
+	
+	// Chunking
+	const chunkSize = 4096
+	audioData := ttsResp.AudioContent
+	for i := 0; i < len(audioData); i += chunkSize {
+		end := i + chunkSize
+		if end > len(audioData) { end = len(audioData) }
+		
+		if err := stream.Send(&mediav1.StreamAudioToCallRequest{
+			CallId: "",
+			AudioChunk: audioData[i:end],
+		}); err != nil {
+			s.log.Error().Err(err).Msg("Ses gönderimi sırasında hata")
+			return nil, err
+		}
+	}
+	
+	// [DÜZELTME]: Bi-Directional Stream Kapatma Mantığı
+	// Önce gönderimi kapatıyoruz.
+	if err := stream.CloseSend(); err != nil {
+		s.log.Error().Err(err).Msg("Stream send kapatılamadı")
+		return nil, err
 	}
 
-	s.log.Info().Str("call_id", callID).Msg("Pipeline başarıyla tamamlandı.")
-	stream.Send(&telephonyv1.RunPipelineResponse{
-		State: telephonyv1.RunPipelineResponse_STATE_STOPPED,
-		Message: "Pipeline finished.",
-	})
+	// Sonra sunucudan gelecek olası hata/durum mesajlarını tüketiyoruz.
+	// Media Service hata dönerse burada yakalarız.
+	for {
+		_, err := stream.Recv()
+		if err == io.EOF {
+			break // Sunucu da kapattı, her şey yolunda.
+		}
+		if err != nil {
+			s.log.Error().Err(err).Msg("Media Service stream hatası döndü")
+			return nil, err
+		}
+	}
 	
-	return nil
+	s.log.Info().Msg("SpeakText başarıyla tamamlandı (TTS -> Media).")
+	return &telephonyv1.SpeakTextResponse{Success: true, Message: "Played"}, nil
 }
 
-// Legacy metodlar
+// Diğer Legacy metodlar
 func (s *Server) PlayAudio(ctx context.Context, req *telephonyv1.PlayAudioRequest) (*telephonyv1.PlayAudioResponse, error) {
 	return &telephonyv1.PlayAudioResponse{Success: true}, nil
+}
+func (s *Server) RunPipeline(req *telephonyv1.RunPipelineRequest, stream telephonyv1.TelephonyActionService_RunPipelineServer) error {
+	return nil 
 }
 func (s *Server) TerminateCall(ctx context.Context, req *telephonyv1.TerminateCallRequest) (*telephonyv1.TerminateCallResponse, error) {
 	return &telephonyv1.TerminateCallResponse{Success: true}, nil
@@ -122,7 +158,6 @@ func Stop(grpcServer *grpc.Server) {
 }
 
 func loadServerTLS(certPath, keyPath, caPath string) (credentials.TransportCredentials, error) {
-	// X509KeyPair kullanıyoruz (PEM -> DER otomatik dönüşümü için)
 	certificate, err := tls.LoadX509KeyPair(certPath, keyPath)
 	if err != nil {
 		return nil, fmt.Errorf("sunucu sertifikası yüklenemedi: %w", err)
