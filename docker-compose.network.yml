@@ -1,0 +1,23 @@
+# =============================================================
+# SENTIRIC NETWORK INFRASTRUCTURE
+# BASIC NETWORK SETUP
+# =============================================================   
+name: sentiric
+
+networks:
+  sentiric-net:
+    driver: bridge
+    name: sentiric-net
+    ipam:
+      config:
+        - subnet: 10.88.0.0/16
+          gateway: 10.88.0.1
+
+services:
+  network-init:
+    image: alpine
+    command: [ "sh", "-c", "echo network ready" ]
+    networks:
+      sentiric-net:
+
+
