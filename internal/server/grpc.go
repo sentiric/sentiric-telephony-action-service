@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net" // Start fonksiyonu için gerekli
 	"os"
 
 	"github.com/rs/zerolog"
@@ -55,6 +56,24 @@ func NewGrpcServer(cfg *config.Config, log zerolog.Logger, clients *client.Clien
 	return grpcServer
 }
 
+// --- HELPER FUNCTIONS (RE-ADDED) ---
+
+// Start: Sunucuyu belirtilen portta dinlemeye başlatır.
+func Start(grpcServer *grpc.Server, port string) error {
+	lis, err := net.Listen("tcp", fmt.Sprintf(":%s", port))
+	if err != nil {
+		return fmt.Errorf("failed to listen: %w", err)
+	}
+	return grpcServer.Serve(lis)
+}
+
+// Stop: Sunucuyu zarifçe durdurur.
+func Stop(grpcServer *grpc.Server) {
+	grpcServer.GracefulStop()
+}
+
+// --- RPC IMPLEMENTATIONS ---
+
 // SpeakText: Metni sese çevirir ve medya servisine iletir.
 func (s *Server) SpeakText(ctx context.Context, req *telephonyv1.SpeakTextRequest) (*telephonyv1.SpeakTextResponse, error) {
 	s.log.Info().Str("call_id", req.CallId).Str("text", req.Text).Msg("📢 SpeakText isteği...")
@@ -95,7 +114,7 @@ func (s *Server) SpeakText(ctx context.Context, req *telephonyv1.SpeakTextReques
 		s.log.Warn().Err(err).Msg("Media stream kapatma uyarısı")
 	}
 	
-	// Ack bekle (FIX: Recv returns (msg, err))
+	// Ack bekle
 	if _, err := mediaStream.Recv(); err != nil && err != io.EOF {
 		s.log.Warn().Err(err).Msg("Media stream final yanıtı alınırken hata oluştu")
 	}
