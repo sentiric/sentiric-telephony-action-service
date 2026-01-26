@@ -6,7 +6,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
-	"fmt" // loadServerTLS içinde %w ile hata sarmalamak için kullanılıyor
+	"fmt"
 	"io"
 	"os"
 
@@ -95,9 +95,10 @@ func (s *Server) SpeakText(ctx context.Context, req *telephonyv1.SpeakTextReques
 		s.log.Warn().Err(err).Msg("Media stream kapatma uyarısı")
 	}
 	
-	// Ack bekle
-	let_ := mediaStream.Recv(); 
-	_ = let_
+	// Ack bekle (FIX: Recv returns (msg, err))
+	if _, err := mediaStream.Recv(); err != nil && err != io.EOF {
+		s.log.Warn().Err(err).Msg("Media stream final yanıtı alınırken hata oluştu")
+	}
 
 	return &telephonyv1.SpeakTextResponse{Success: true}, nil
 }
@@ -146,7 +147,6 @@ func loadServerTLS(certPath, keyPath, caPath string) (credentials.TransportCrede
 
 	cert, err := tls.LoadX509KeyPair(certPath, keyPath)
 	if err != nil { 
-		// fmt kullanımı burada (%w ile hata sarmalama)
 		return nil, fmt.Errorf("keypair yükleme hatası: %w", err) 
 	}
 	
