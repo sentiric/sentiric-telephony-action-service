@@ -5,15 +5,15 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
-	"fmt"
+	"errors"
+	"fmt" // loadServerTLS içinde %w ile hata sarmalamak için kullanılıyor
 	"io"
-	"net"
 	"os"
 
 	"github.com/rs/zerolog"
 	
-	telephonyv1 "github.com/sentiric/sentiric-contracts/gen/go/sentiric/telephony/v1"
 	mediav1 "github.com/sentiric/sentiric-contracts/gen/go/sentiric/media/v1"
+	telephonyv1 "github.com/sentiric/sentiric-contracts/gen/go/sentiric/telephony/v1"
 	ttsv1 "github.com/sentiric/sentiric-contracts/gen/go/sentiric/tts/v1"
 
 	"github.com/sentiric/sentiric-telephony-action-service/internal/client"
@@ -30,6 +30,7 @@ type Server struct {
 	log             zerolog.Logger
 }
 
+// NewGrpcServer: gRPC sunucusunu yapılandırır.
 func NewGrpcServer(cfg *config.Config, log zerolog.Logger, clients *client.Clients) *grpc.Server {
 	var opts []grpc.ServerOption
 
@@ -54,22 +55,19 @@ func NewGrpcServer(cfg *config.Config, log zerolog.Logger, clients *client.Clien
 	return grpcServer
 }
 
-// SpeakText: Basit metin okuma (Fire and Forget veya Block)
+// SpeakText: Metni sese çevirir ve medya servisine iletir.
 func (s *Server) SpeakText(ctx context.Context, req *telephonyv1.SpeakTextRequest) (*telephonyv1.SpeakTextResponse, error) {
 	s.log.Info().Str("call_id", req.CallId).Str("text", req.Text).Msg("📢 SpeakText isteği...")
 	
-	// TTS'den al, Media'ya bas (Tek yönlü)
-	// PipelineManager içindeki streamTTS fonksiyonunu yeniden kullanabiliriz ancak
-	// burada media connection'ı sıfırdan kurmamız gerekir.
-	
-	// Basitlik için burada inline implementasyon yapıyoruz:
 	clients := s.pipelineManager.GetClients()
 	
 	// 1. Media Bağlantısı
 	mediaStream, err := clients.Media.StreamAudioToCall(ctx)
 	if err != nil { return nil, err }
-	// Handshake
-	mediaStream.Send(&mediav1.StreamAudioToCallRequest{CallId: req.CallId})
+	
+	if err := mediaStream.Send(&mediav1.StreamAudioToCallRequest{CallId: req.CallId}); err != nil {
+		return nil, err
+	}
 
 	// 2. TTS İsteği
 	ttsReq := &ttsv1.SynthesizeStreamRequest{
@@ -87,27 +85,32 @@ func (s *Server) SpeakText(ctx context.Context, req *telephonyv1.SpeakTextReques
 		if err != nil { return nil, err }
 		
 		if len(chunk.AudioContent) > 0 {
-			mediaStream.Send(&mediav1.StreamAudioToCallRequest{AudioChunk: chunk.AudioContent})
+			if err := mediaStream.Send(&mediav1.StreamAudioToCallRequest{AudioChunk: chunk.AudioContent}); err != nil {
+				return nil, err
+			}
 		}
 	}
-	mediaStream.CloseSend()
 	
-	// Wait for media ack
-	mediaStream.Recv()
+	if err := mediaStream.CloseSend(); err != nil {
+		s.log.Warn().Err(err).Msg("Media stream kapatma uyarısı")
+	}
 	
+	// Ack bekle
+	let_ := mediaStream.Recv(); 
+	_ = let_
+
 	return &telephonyv1.SpeakTextResponse{Success: true}, nil
 }
 
-// RunPipeline: Tam çift yönlü akıllı diyalog başlatır
+// RunPipeline: Tam çift yönlü akıllı diyalog başlatır.
 func (s *Server) RunPipeline(req *telephonyv1.RunPipelineRequest, stream telephonyv1.TelephonyActionService_RunPipelineServer) error {
 	s.log.Info().Str("call_id", req.CallId).Msg("🔄 RunPipeline RPC çağrıldı.")
 	
-	// Stream context'i iptal edilene kadar pipeline'ı çalıştır
 	err := s.pipelineManager.RunPipeline(
 		stream.Context(),
 		req.CallId,
 		req.SessionId,
-		"unknown_user", // User ID gerekirse request'e eklenmeli
+		"unknown_user", 
 		req.MediaInfo.ServerRtpPort,
 	)
 	
@@ -119,22 +122,43 @@ func (s *Server) RunPipeline(req *telephonyv1.RunPipelineRequest, stream telepho
 	return nil
 }
 
-// ... Diğer Legacy Metotlar (PlayAudio vb.) ...
+// Legacy Metotlar
 func (s *Server) PlayAudio(ctx context.Context, req *telephonyv1.PlayAudioRequest) (*telephonyv1.PlayAudioResponse, error) {
-	// ... Mevcut implementasyon korunabilir veya MediaService'e proxy edilebilir ...
     return &telephonyv1.PlayAudioResponse{Success: true}, nil
 }
+func (s *Server) TerminateCall(ctx context.Context, req *telephonyv1.TerminateCallRequest) (*telephonyv1.TerminateCallResponse, error) { return &telephonyv1.TerminateCallResponse{Success: true}, nil }
+func (s *Server) SendTextMessage(ctx context.Context, req *telephonyv1.SendTextMessageRequest) (*telephonyv1.SendTextMessageResponse, error) { return &telephonyv1.SendTextMessageResponse{Success: true}, nil }
+func (s *Server) StartRecording(ctx context.Context, req *telephonyv1.StartRecordingRequest) (*telephonyv1.StartRecordingResponse, error) { return &telephonyv1.StartRecordingResponse{Success: true}, nil }
+func (s *Server) StopRecording(ctx context.Context, req *telephonyv1.StopRecordingRequest) (*telephonyv1.StopRecordingResponse, error) { return &telephonyv1.StopRecordingResponse{Success: true}, nil }
+func (s *Server) BridgeCall(ctx context.Context, req *telephonyv1.BridgeCallRequest) (*telephonyv1.BridgeCallResponse, error) { return &telephonyv1.BridgeCallResponse{Success: true}, nil }
 
 // TLS Helper
 func loadServerTLS(certPath, keyPath, caPath string) (credentials.TransportCredentials, error) {
+	if _, err := os.Stat(certPath); os.IsNotExist(err) {
+		return nil, errors.New("sertifika dosyası bulunamadı: " + certPath)
+	}
+	if _, err := os.Stat(keyPath); os.IsNotExist(err) {
+		return nil, errors.New("anahtar dosyası bulunamadı: " + keyPath)
+	}
+	if _, err := os.Stat(caPath); os.IsNotExist(err) {
+		return nil, errors.New("CA dosyası bulunamadı: " + caPath)
+	}
+
 	cert, err := tls.LoadX509KeyPair(certPath, keyPath)
-	if err != nil { return nil, err }
+	if err != nil { 
+		// fmt kullanımı burada (%w ile hata sarmalama)
+		return nil, fmt.Errorf("keypair yükleme hatası: %w", err) 
+	}
 	
 	caData, err := os.ReadFile(caPath)
-	if err != nil { return nil, err }
+	if err != nil { 
+		return nil, fmt.Errorf("CA okuma hatası: %w", err) 
+	}
 	
 	pool := x509.NewCertPool()
-	pool.AppendCertsFromPEM(caData)
+	if !pool.AppendCertsFromPEM(caData) {
+		return nil, errors.New("CA sertifikası havuza eklenemedi")
+	}
 	
 	return credentials.NewTLS(&tls.Config{
 		Certificates: []tls.Certificate{cert},
