@@ -1,62 +1,85 @@
+// internal/config/config.go
 package config
 
 import (
 	"os"
+	"strings"
 
 	"github.com/joho/godotenv"
 	"github.com/rs/zerolog/log"
 )
 
 type Config struct {
+	Env         string
+	LogLevel    string
+	ServiceVersion string
+
+	// Server
 	GRPCPort string
 	HttpPort string
+	MetricsPort string
+
+	// Security (mTLS)
 	CertPath string
 	KeyPath  string
 	CaPath   string
-	LogLevel string
-	Env      string
 
-	// Bağımlı Servisler
-	MediaServiceURL  string
-	TtsGatewayURL    string
-	SttGatewayURL    string
-	DialogServiceURL string
-	SipSignalingURL  string
+	// Dependencies (Gateways)
+	MediaServiceURL    string
+	SttGatewayURL      string
+	TtsGatewayURL      string
+	DialogServiceURL   string
+	SipSignalingURL    string
 }
 
 func Load() (*Config, error) {
-	godotenv.Load() // .env varsa yükle
+	_ = godotenv.Load() // .env varsa yükle, yoksa environment'a güven
 
-	return &Config{
-		GRPCPort: GetEnv("TELEPHONY_ACTION_SERVICE_GRPC_PORT", "13051"),
-		HttpPort: GetEnv("TELEPHONY_ACTION_SERVICE_HTTP_PORT", "13050"),
+	cfg := &Config{
+		Env:            getEnv("ENV", "production"),
+		LogLevel:       getEnv("LOG_LEVEL", "info"),
+		ServiceVersion: getEnv("SERVICE_VERSION", "1.0.0"),
 
-		CertPath: GetEnvOrFail("TELEPHONY_ACTION_SERVICE_CERT_PATH"),
-		KeyPath:  GetEnvOrFail("TELEPHONY_ACTION_SERVICE_KEY_PATH"),
-		CaPath:   GetEnvOrFail("GRPC_TLS_CA_PATH"),
-		
-		LogLevel: GetEnv("LOG_LEVEL", "info"),
-		Env:      GetEnv("ENV", "production"),
+		GRPCPort:    getEnv("TELEPHONY_ACTION_SERVICE_GRPC_PORT", "13111"),
+		HttpPort:    getEnv("TELEPHONY_ACTION_SERVICE_HTTP_PORT", "13110"),
+		MetricsPort: getEnv("TELEPHONY_ACTION_SERVICE_METRICS_PORT", "13112"),
 
-		MediaServiceURL:  GetEnv("MEDIA_SERVICE_TARGET_GRPC_URL", "media-service:13031"),
-		TtsGatewayURL:    GetEnv("TTS_GATEWAY_TARGET_GRPC_URL", "tts-gateway:14011"),
-		SttGatewayURL:    GetEnv("STT_GATEWAY_TARGET_GRPC_URL", "stt-gateway:15021"),
-		DialogServiceURL: GetEnv("DIALOG_SERVICE_TARGET_GRPC_URL", "dialog-service:12061"),
-		SipSignalingURL:  GetEnv("SIP_SIGNALING_TARGET_GRPC_URL", "sip-signaling-service:13021"),
-	}, nil
+		CertPath: getEnvOrFail("TELEPHONY_ACTION_SERVICE_CERT_PATH"),
+		KeyPath:  getEnvOrFail("TELEPHONY_ACTION_SERVICE_KEY_PATH"),
+		CaPath:   getEnvOrFail("GRPC_TLS_CA_PATH"),
+
+		MediaServiceURL:  fixUrl(getEnv("MEDIA_SERVICE_TARGET_GRPC_URL", "media-service:13031")),
+		SttGatewayURL:    fixUrl(getEnv("STT_GATEWAY_TARGET_GRPC_URL", "stt-gateway-service:15021")),
+		TtsGatewayURL:    fixUrl(getEnv("TTS_GATEWAY_TARGET_GRPC_URL", "tts-gateway-service:14011")),
+		DialogServiceURL: fixUrl(getEnv("DIALOG_SERVICE_TARGET_GRPC_URL", "dialog-service:12061")),
+		SipSignalingURL:  fixUrl(getEnv("SIP_SIGNALING_TARGET_GRPC_URL", "sip-signaling-service:13021")),
+	}
+
+	return cfg, nil
 }
 
-func GetEnv(key, fallback string) string {
+func getEnv(key, fallback string) string {
 	if value, exists := os.LookupEnv(key); exists {
 		return value
 	}
 	return fallback
 }
 
-func GetEnvOrFail(key string) string {
-	value, exists := os.LookupEnv(key)
-	if !exists {
-		log.Fatal().Str("variable", key).Msg("Gerekli ortam değişkeni eksik. Lütfen .env dosyasını kontrol edin.")
+func getEnvOrFail(key string) string {
+	if value, exists := os.LookupEnv(key); exists {
+		return value
 	}
-	return value
+	log.Fatal().Str("var", key).Msg("Kritik ortam değişkeni eksik!")
+	return ""
+}
+
+// fixUrl: gRPC bağlantıları için http/https ön ekini temizler (Go gRPC client için gerekli)
+func fixUrl(url string) string {
+	if strings.Contains(url, "://") {
+		parts := strings.Split(url, "://")
+		if len(parts) > 1 {
+			return parts[1]
+		}
+	}
+	return url
 }

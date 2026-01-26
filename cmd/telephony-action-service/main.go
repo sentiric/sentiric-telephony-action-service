@@ -1,7 +1,10 @@
+// cmd/telephony-action-service/main.go
 package main
 
 import (
 	"context"
+	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -15,66 +18,47 @@ import (
 )
 
 var (
-	ServiceVersion string
-	GitCommit      string
-	BuildDate      string
+	ServiceVersion string = "1.1.0"
 )
 
 func main() {
 	cfg, err := config.Load()
+	if err != nil { panic(err) }
+
+	log := logger.New("telephony-action-service", cfg.Env, cfg.LogLevel)
+	log.Info().Str("version", ServiceVersion).Msg("🚀 Servis başlatılıyor...")
+
+	// 1. İstemcileri Başlat
+	clients, err := client.NewClients(cfg, log)
 	if err != nil {
-		// Logger henüz hazır olmadığı için panic kullanıyoruz
-		panic("Konfigürasyon yüklenemedi: " + err.Error())
+		log.Fatal().Err(err).Msg("Bağımlı servislere bağlanılamadı")
 	}
 
-	appLog := logger.New("telephony-action-service", cfg.Env, cfg.LogLevel)
+	// 2. gRPC Sunucusu
+	grpcServer := server.NewGrpcServer(cfg, log, clients)
+	lis, err := net.Listen("tcp", fmt.Sprintf(":%s", cfg.GRPCPort))
+	if err != nil { log.Fatal().Err(err).Msg("gRPC portu açılamadı") }
 
-	appLog.Info().
-		Str("version", ServiceVersion).
-		Str("commit", GitCommit).
-		Str("build_date", BuildDate).
-		Str("profile", cfg.Env).
-		Msg("🚀 Sentiric Telephony Action Service başlatılıyor...")
-
-	clients, err := client.NewClients(cfg)
-	if err != nil {
-		appLog.Fatal().Err(err).Msg("İstemciler başlatılamadı")
-	}
-
-	grpcServer := server.NewGrpcServer(cfg.CertPath, cfg.KeyPath, cfg.CaPath, appLog, clients)
-	
-	// gRPC Server
 	go func() {
-		appLog.Info().Str("port", cfg.GRPCPort).Msg("gRPC Sunucusu dinleniyor")
-		if err := server.Start(grpcServer, cfg.GRPCPort); err != nil {
-			appLog.Fatal().Err(err).Msg("gRPC Sunucusu hatayla kapandı")
-		}
-	}()
-	
-	// Health Check HTTP Sunucusu
-	go func() {
-		http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-			w.WriteHeader(200)
-			w.Write([]byte("OK"))
-		})
-		
-		addr := ":" + cfg.HttpPort
-		appLog.Info().Str("addr", addr).Msg("HTTP Health Check dinleniyor")
-		if err := http.ListenAndServe(addr, nil); err != nil {
-			appLog.Error().Err(err).Msg("HTTP sunucusu hatası")
+		log.Info().Str("port", cfg.GRPCPort).Msg("gRPC dinleniyor")
+		if err := grpcServer.Serve(lis); err != nil {
+			log.Fatal().Err(err).Msg("gRPC hatası")
 		}
 	}()
 
+	// 3. Health Check
+	go func() {
+		http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200); w.Write([]byte("OK")) })
+		log.Info().Str("port", cfg.HttpPort).Msg("HTTP dinleniyor")
+		http.ListenAndServe(":"+cfg.HttpPort, nil)
+	}()
+
+	// 4. Shutdown
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
 	
-	appLog.Warn().Msg("Kapatma sinyali alındı...")
-	
-	// Graceful shutdown context
-	_, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	server.Stop(grpcServer)
-	appLog.Info().Msg("Servis durduruldu.")
+	log.Warn().Msg("Kapatılıyor...")
+	grpcServer.GracefulStop()
+	log.Info().Msg("Bitti.")
 }
