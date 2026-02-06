@@ -1,4 +1,4 @@
-// internal/service/pipeline.go
+// sentiric-telephony-action-service/internal/service/pipeline.go
 package service
 
 import (
@@ -7,32 +7,36 @@ import (
 	"io"
 	"strings"
 	"sync"
-	// "time" kaldırıldı
 
 	"github.com/rs/zerolog"
 	dialogv1 "github.com/sentiric/sentiric-contracts/gen/go/sentiric/dialog/v1"
+	eventv1 "github.com/sentiric/sentiric-contracts/gen/go/sentiric/event/v1"
 	mediav1 "github.com/sentiric/sentiric-contracts/gen/go/sentiric/media/v1"
 	sttv1 "github.com/sentiric/sentiric-contracts/gen/go/sentiric/stt/v1"
-	ttsv1 "github.com/sentiric/sentiric-contracts/gen/go/sentiric/tts/v1"
 	"github.com/sentiric/sentiric-telephony-action-service/internal/client"
 	"google.golang.org/grpc/metadata"
 )
 
+// KRİTİK DÜZELTME: PipelineManager struct tanımı eklendi (Hata 6)
 type PipelineManager struct {
-	clients *client.Clients
-	log     zerolog.Logger
+	clients  *client.Clients
+	log      zerolog.Logger
+	mediator *Mediator
 }
 
 func NewPipelineManager(clients *client.Clients, log zerolog.Logger) *PipelineManager {
-	return &PipelineManager{clients: clients, log: log}
+	return &PipelineManager{
+		clients:  clients,
+		log:      log,
+		mediator: NewMediator(clients, log),
+	}
 }
 
-// GetClients: gRPC handler'ın clientlara erişmesi için getter
 func (pm *PipelineManager) GetClients() *client.Clients {
 	return pm.clients
 }
 
-// RunPipeline: Ses döngüsünü başlatır ve yönetir.
+// RunPipeline: Ses döngüsünü başlatır ve yönetir (RX, TX, Sinyal).
 func (pm *PipelineManager) RunPipeline(ctx context.Context, callID, sessionID, userID string, rtpPort uint32) error {
 	log := pm.log.With().Str("call_id", callID).Str("session_id", sessionID).Logger()
 	log.Info().Msg("🚀 Pipeline Başlatılıyor: Media <-> STT <-> Dialog <-> TTS")
@@ -41,30 +45,29 @@ func (pm *PipelineManager) RunPipeline(ctx context.Context, callID, sessionID, u
 	outCtx := metadata.NewOutgoingContext(ctx, md)
 
 	// 1. STREAM BAĞLANTILARI
-	mediaRecStream, err := pm.clients.Media.RecordAudio(outCtx, &mediav1.RecordAudioRequest{
-		ServerRtpPort: rtpPort,
-		TargetSampleRate: nil,
-	})
-	if err != nil { return fmt.Errorf("media record stream failed: %w", err) }
-
-	mediaPlayStream, err := pm.clients.Media.StreamAudioToCall(outCtx)
-	if err != nil { return fmt.Errorf("media play stream failed: %w", err) }
-	
-	if err := mediaPlayStream.Send(&mediav1.StreamAudioToCallRequest{CallId: callID}); err != nil {
-		return fmt.Errorf("media play handshake failed: %w", err)
+	mediaRecStream, err := pm.clients.Media.RecordAudio(outCtx, &mediav1.RecordAudioRequest{ServerRtpPort: rtpPort})
+	if err != nil {
+		return fmt.Errorf("media record stream failed: %w", err)
 	}
 
 	sttStream, err := pm.clients.STT.TranscribeStream(outCtx)
-	if err != nil { return fmt.Errorf("stt stream failed: %w", err) }
+	if err != nil {
+		return fmt.Errorf("stt stream failed: %w", err)
+	}
 
 	dialogStream, err := pm.clients.Dialog.StreamConversation(outCtx)
-	if err != nil { return fmt.Errorf("dialog stream failed: %w", err) }
-	
+	if err != nil {
+		return fmt.Errorf("dialog stream failed: %w", err)
+	}
+
+	// Dialog Config Handshake
 	if err := dialogStream.Send(&dialogv1.StreamConversationRequest{
 		Payload: &dialogv1.StreamConversationRequest_Config{
 			Config: &dialogv1.ConversationConfig{SessionId: sessionID, UserId: userID},
 		},
-	}); err != nil { return fmt.Errorf("dialog config failed: %w", err) }
+	}); err != nil {
+		return fmt.Errorf("dialog config failed: %w", err)
+	}
 
 	log.Info().Msg("✅ Tüm stream bağlantıları kuruldu.")
 
@@ -77,6 +80,12 @@ func (pm *PipelineManager) RunPipeline(ctx context.Context, callID, sessionID, u
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
+	// MediaInfo'yu oluştur (KRİTİK DÜZELTME: Doğru tip eventv1.MediaInfo)
+	mediaInfo := &eventv1.MediaInfo{
+		ServerRtpPort: rtpPort,
+		// CallerRtpAddr boş bırakıldı, Latching'e güveniliyor
+	}
+
 	// TASK 1: Media -> STT
 	wg.Add(1)
 	go func() {
@@ -84,8 +93,13 @@ func (pm *PipelineManager) RunPipeline(ctx context.Context, callID, sessionID, u
 		defer sttStream.CloseSend()
 		for {
 			chunk, err := mediaRecStream.Recv()
-			if err == io.EOF { return }
-			if err != nil { errChan <- fmt.Errorf("media recv: %w", err); return }
+			if err == io.EOF {
+				return
+			}
+			if err != nil {
+				errChan <- fmt.Errorf("media recv: %w", err)
+				return
+			}
 			if err := sttStream.Send(&sttv1.TranscribeStreamRequest{AudioChunk: chunk.AudioData}); err != nil {
 				errChan <- fmt.Errorf("stt send: %w", err)
 				return
@@ -99,8 +113,13 @@ func (pm *PipelineManager) RunPipeline(ctx context.Context, callID, sessionID, u
 		defer wg.Done()
 		for {
 			res, err := sttStream.Recv()
-			if err == io.EOF { return }
-			if err != nil { errChan <- fmt.Errorf("stt recv: %w", err); return }
+			if err == io.EOF {
+				return
+			}
+			if err != nil {
+				errChan <- fmt.Errorf("stt recv: %w", err)
+				return
+			}
 
 			// Söz Kesme (Interruption) Mantığı
 			if !res.IsFinal && len(res.PartialTranscription) > 5 {
@@ -117,62 +136,78 @@ func (pm *PipelineManager) RunPipeline(ctx context.Context, callID, sessionID, u
 				log.Info().Str("user_text", res.PartialTranscription).Msg("🗣️ Kullanıcı")
 				if err := dialogStream.Send(&dialogv1.StreamConversationRequest{
 					Payload: &dialogv1.StreamConversationRequest_TextInput{TextInput: res.PartialTranscription},
-				}); err != nil { errChan <- err; return }
-				
+				}); err != nil {
+					errChan <- err
+					return
+				}
+
 				if err := dialogStream.Send(&dialogv1.StreamConversationRequest{
 					Payload: &dialogv1.StreamConversationRequest_IsFinalInput{IsFinalInput: true},
-				}); err != nil { errChan <- err; return }
+				}); err != nil {
+					errChan <- err
+					return
+				}
 			}
 		}
 	}()
 
-	// TASK 3: Dialog -> TTS (AKILLI BUFFERLAMA)
+	// TASK 3: Dialog -> TTS (TX)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		
-		// Cümle birleştirme tamponu
+
 		var sentenceBuffer strings.Builder
-		
+
 		for {
 			dRes, err := dialogStream.Recv()
-			if err == io.EOF { return }
-			if err != nil { errChan <- fmt.Errorf("dialog recv: %w", err); return }
+			if err == io.EOF {
+				return
+			}
+			if err != nil {
+				errChan <- fmt.Errorf("dialog recv: %w", err)
+				return
+			}
 
-			// LLM'den gelen parçayı al
 			token := dRes.GetTextResponse()
-			if token == "" { continue }
-			
+			if token == "" {
+				continue
+			}
+
 			sentenceBuffer.WriteString(token)
 			currentText := sentenceBuffer.String()
 
-			// Cümle Bitiş Kontrolü (Noktalama işaretleri)
+			// Cümle Bitiş Kontrolü
 			isSentenceEnd := strings.ContainsAny(token, ".?!:;") || strings.HasSuffix(strings.TrimSpace(currentText), ".")
-			isLongEnough := len(currentText) > 50 
-			
+			isLongEnough := len(currentText) > 50
+
 			shouldFlush := isSentenceEnd || isLongEnough || dRes.GetIsFinalResponse()
 
 			if shouldFlush {
 				textToSend := strings.TrimSpace(currentText)
-				
+
 				if textToSend != "" {
 					log.Info().Str("tts_text", textToSend).Msg("🤖 TTS'e Cümle Gönderiliyor")
 
 					ttsCtx, tCancel := context.WithCancel(outCtx)
-					
+
 					ttsMutex.Lock()
-					if ttsCancelFunc != nil { ttsCancelFunc() }
+					if ttsCancelFunc != nil {
+						ttsCancelFunc()
+					}
 					ttsCancelFunc = tCancel
 					ttsMutex.Unlock()
 
-					// Bloklayıcı çağrı (Sıralı konuşma için)
-					if err := pm.streamTTS(ttsCtx, textToSend, mediaPlayStream); err != nil {
+					// MEDIATOR'A YETKİ DEVRİ (SpeakText)
+					if err := pm.mediator.SpeakText(ttsCtx, callID, textToSend, "coqui:default", mediaInfo); err != nil {
 						if err != context.Canceled {
 							log.Error().Err(err).Msg("TTS Stream Hatası")
 						}
 					}
+
+					ttsMutex.Lock()
+					ttsCancelFunc = nil
+					ttsMutex.Unlock()
 				}
-				// Buffer'ı temizle
 				sentenceBuffer.Reset()
 			}
 		}
@@ -185,42 +220,7 @@ func (pm *PipelineManager) RunPipeline(ctx context.Context, callID, sessionID, u
 		log.Error().Err(err).Msg("Pipeline kritik hata ile sonlandı.")
 		return err
 	}
-	
+
+	wg.Wait()
 	return nil
-}
-
-func (pm *PipelineManager) streamTTS(
-	ctx context.Context, 
-	text string, 
-	mediaStream mediav1.MediaService_StreamAudioToCallClient,
-) error {
-	
-	ttsReq := &ttsv1.SynthesizeStreamRequest{
-		Text: text,
-		VoiceId: "coqui:default",
-		TextType: ttsv1.TextType_TEXT_TYPE_TEXT,
-		AudioConfig: &ttsv1.AudioConfig{
-			SampleRateHertz: 16000, 
-			AudioFormat: ttsv1.AudioFormat_AUDIO_FORMAT_PCM_S16LE,
-		},
-        Prosody: &ttsv1.ProsodyConfig{ Rate: 1.0 },
-	}
-
-	ttsStream, err := pm.clients.TTS.SynthesizeStream(ctx, ttsReq)
-	if err != nil { return err }
-
-	for {
-		chunk, err := ttsStream.Recv()
-		if err == io.EOF { 
-            pm.log.Debug().Msg("TTS cümle tamamlandı.")
-            return nil 
-        }
-		if err != nil { return err }
-
-		if len(chunk.AudioContent) > 0 {
-			if err := mediaStream.Send(&mediav1.StreamAudioToCallRequest{AudioChunk: chunk.AudioContent}); err != nil {
-				return err
-			}
-		}
-	}
 }

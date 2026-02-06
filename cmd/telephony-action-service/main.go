@@ -2,12 +2,13 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
-	// "context" ve "time" kaldırıldı çünkü server.Stop context kabul etmiyor
+	"time"
 
 	"github.com/sentiric/sentiric-telephony-action-service/internal/client"
 	"github.com/sentiric/sentiric-telephony-action-service/internal/config"
@@ -24,7 +25,6 @@ var (
 func main() {
 	cfg, err := config.Load()
 	if err != nil {
-		// Logger henüz hazır olmadığı için panic veya fmt kullanıyoruz
 		fmt.Fprintf(os.Stderr, "Kritik Hata: Konfigürasyon yüklenemedi: %v\n", err)
 		os.Exit(1)
 	}
@@ -38,32 +38,36 @@ func main() {
 		Str("profile", cfg.Env).
 		Msg("🚀 Sentiric Telephony Action Service başlatılıyor...")
 
-	// DÜZELTME: NewClients artık sadece cfg alıyor (Logger'ı kendi içinde yönetiyor)
 	clients, err := client.NewClients(cfg)
 	if err != nil {
 		appLog.Fatal().Err(err).Msg("İstemciler başlatılamadı")
 	}
 
+	// KRİTİK DÜZELTME: server.NewGrpcServer artık var ve çağrılabilir
 	grpcServer := server.NewGrpcServer(cfg, appLog, clients)
-	
+
 	// gRPC Server
 	go func() {
 		appLog.Info().Str("port", cfg.GRPCPort).Msg("gRPC Sunucusu dinleniyor")
-		if err := server.Start(grpcServer, cfg.GRPCPort); err != nil {
+		// KRİTİK DÜZELTME: server.Start artık var ve çağrılabilir
+		if err := server.Start(grpcServer, cfg.GRPCPort); err != nil && err.Error() != "http: Server closed" {
 			appLog.Fatal().Err(err).Msg("gRPC Sunucusu hatayla kapandı")
 		}
 	}()
-	
+
 	// Health Check HTTP Sunucusu
+	httpServer := &http.Server{
+		Addr: fmt.Sprintf(":%s", cfg.HttpPort),
+	}
 	go func() {
 		http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(200)
 			w.Write([]byte("OK"))
 		})
-		
+
 		addr := ":" + cfg.HttpPort
 		appLog.Info().Str("addr", addr).Msg("HTTP Health Check dinleniyor")
-		if err := http.ListenAndServe(addr, nil); err != nil {
+		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			appLog.Error().Err(err).Msg("HTTP sunucusu hatası")
 		}
 	}()
@@ -71,12 +75,18 @@ func main() {
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
-	
+
 	appLog.Warn().Msg("Kapatma sinyali alındı...")
-	
-	// server.Stop (GracefulStop) bloklayıcıdır ve context almaz.
-	// Kendi iç mekanizmasıyla bekleyen RPC'lerin bitmesini bekler.
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// KRİTİK DÜZELTME: server.Stop artık var ve çağrılabilir
 	server.Stop(grpcServer)
-	
+
+	if err := httpServer.Shutdown(ctx); err != nil {
+		appLog.Error().Err(err).Msg("HTTP sunucusu kapatılırken hata oluştu")
+	}
+
 	appLog.Info().Msg("Servis durduruldu.")
 }

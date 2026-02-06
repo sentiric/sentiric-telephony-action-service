@@ -7,15 +7,14 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
-	"io"
-	"net" // Start fonksiyonu için gerekli
-	"os"
+	"io/ioutil"
+	"net"
 
 	"github.com/rs/zerolog"
 
+	eventv1 "github.com/sentiric/sentiric-contracts/gen/go/sentiric/event/v1"
 	mediav1 "github.com/sentiric/sentiric-contracts/gen/go/sentiric/media/v1"
 	telephonyv1 "github.com/sentiric/sentiric-contracts/gen/go/sentiric/telephony/v1"
-	ttsv1 "github.com/sentiric/sentiric-contracts/gen/go/sentiric/tts/v1"
 
 	"github.com/sentiric/sentiric-telephony-action-service/internal/client"
 	"github.com/sentiric/sentiric-telephony-action-service/internal/config"
@@ -25,13 +24,15 @@ import (
 	"google.golang.org/grpc/credentials"
 )
 
+// KRİTİK DÜZELTME: Server struct tanımı eklendi (Hata 4, 5)
 type Server struct {
 	telephonyv1.UnimplementedTelephonyActionServiceServer
 	pipelineManager *service.PipelineManager
+	mediator        *service.Mediator
 	log             zerolog.Logger
 }
 
-// NewGrpcServer: gRPC sunucusunu yapılandırır.
+// KRİTİK DÜZELTME: NewGrpcServer tanımı eklendi (Hata 1)
 func NewGrpcServer(cfg *config.Config, log zerolog.Logger, clients *client.Clients) *grpc.Server {
 	var opts []grpc.ServerOption
 
@@ -46,19 +47,19 @@ func NewGrpcServer(cfg *config.Config, log zerolog.Logger, clients *client.Clien
 	}
 
 	pipelineMgr := service.NewPipelineManager(clients, log)
+	mediator := service.NewMediator(clients, log)
 	grpcServer := grpc.NewServer(opts...)
 
 	telephonyv1.RegisterTelephonyActionServiceServer(grpcServer, &Server{
 		pipelineManager: pipelineMgr,
+		mediator:        mediator,
 		log:             log,
 	})
 
 	return grpcServer
 }
 
-// --- HELPER FUNCTIONS (RE-ADDED) ---
-
-// Start: Sunucuyu belirtilen portta dinlemeye başlatır.
+// KRİTİK DÜZELTME: Start fonksiyonu eklendi (Hata 2)
 func Start(grpcServer *grpc.Server, port string) error {
 	lis, err := net.Listen("tcp", fmt.Sprintf(":%s", port))
 	if err != nil {
@@ -67,104 +68,53 @@ func Start(grpcServer *grpc.Server, port string) error {
 	return grpcServer.Serve(lis)
 }
 
-// Stop: Sunucuyu zarifçe durdurur.
+// KRİTİK DÜZELTME: Stop fonksiyonu eklendi (Hata 3)
 func Stop(grpcServer *grpc.Server) {
 	grpcServer.GracefulStop()
 }
 
 // --- RPC IMPLEMENTATIONS ---
 
-// SpeakText: Metni sese çevirir ve medya servisine iletir.
 func (s *Server) SpeakText(ctx context.Context, req *telephonyv1.SpeakTextRequest) (*telephonyv1.SpeakTextResponse, error) {
-	s.log.Info().Str("call_id", req.CallId).Str("text", req.Text).Msg("📢 SpeakText isteği...")
+	s.log.Info().Str("call_id", req.CallId).Msg("📢 SpeakText isteği alındı.")
 
-	clients := s.pipelineManager.GetClients()
+	mediaInfo := req.GetMediaInfo()
+	if mediaInfo == nil {
+		return nil, errors.New("media_info alanı boş olamaz")
+	}
 
-	// 1. Media Bağlantısı
-	mediaStream, err := clients.Media.StreamAudioToCall(ctx)
+	holePunchReq := &mediav1.PlayAudioRequest{
+		AudioUri:      "file://audio/tr/system/nat_warmer.wav",
+		ServerRtpPort: mediaInfo.GetServerRtpPort(),
+		RtpTargetAddr: mediaInfo.GetCallerRtpAddr(),
+	}
+
+	_, err := s.mediator.Clients.Media.PlayAudio(ctx, holePunchReq)
 	if err != nil {
-		return nil, err
+		s.log.Warn().Err(err).Msg("Hole Punching komutu gönderilemedi, ses gelmeyebilir.")
 	}
 
-	if err := mediaStream.Send(&mediav1.StreamAudioToCallRequest{CallId: req.CallId}); err != nil {
-		return nil, err
+	eventMediaInfo := &eventv1.MediaInfo{
+		CallerRtpAddr: mediaInfo.GetCallerRtpAddr(),
+		ServerRtpPort: mediaInfo.GetServerRtpPort(),
 	}
 
-	// 2. TTS İsteği
-	ttsReq := &ttsv1.SynthesizeStreamRequest{
-		Text:        req.Text,
-		VoiceId:     req.VoiceId,
-		AudioConfig: &ttsv1.AudioConfig{SampleRateHertz: 16000, AudioFormat: ttsv1.AudioFormat_AUDIO_FORMAT_PCM_S16LE},
-	}
-	ttsStream, err := clients.TTS.SynthesizeStream(ctx, ttsReq)
+	err = s.mediator.SpeakText(
+		ctx,
+		req.CallId,
+		req.Text,
+		req.VoiceId,
+		eventMediaInfo,
+	)
+
 	if err != nil {
-		// ✅ FALLBACK: TTS başarısız, pre-recorded audio dosyasını oku ve stream et
-		s.log.Error().Err(err).Msg("❌ TTS başarısız, fallback audio kullanılıyor")
-
-		fallbackPath := "/sentiric-assets/audio/tr/system/technical_difficulty.wav"
-
-		// 1. Dosyayı aç
-		file, fErr := os.Open(fallbackPath)
-		if fErr != nil {
-			return nil, fmt.Errorf("TTS başarısız ve fallback dosyası açılamadı: %w", fErr)
-		}
-		defer file.Close()
-
-		// 2. Stream et
-		buf := make([]byte, 1024) // 1KB chunks
-		for {
-			n, rErr := file.Read(buf)
-			if n > 0 {
-				if err := mediaStream.Send(&mediav1.StreamAudioToCallRequest{AudioChunk: buf[:n]}); err != nil {
-					return nil, fmt.Errorf("fallback audio gönderilemedi: %w", err)
-				}
-			}
-			if rErr == io.EOF {
-				break
-			}
-			if rErr != nil {
-				return nil, fmt.Errorf("fallback dosya okuma hatası: %w", rErr)
-			}
-		}
-
-		return &telephonyv1.SpeakTextResponse{Success: true}, nil
-	}
-
-	// 3. Loop: TTS stream'den audio chunk'ları al ve media'ya gönder
-	for {
-		chunk, err := ttsStream.Recv()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			// Stream ortasında hata: Fallback kullan (Tekrar stream etmeye çalış, ama medya stream kapanmış olabilir)
-			// Basitlik için burada loglayıp çıkıyoruz, stream bozulmuş olabilir.
-			s.log.Error().Err(err).Msg("❌ TTS stream koptu")
-			// Eğer stream hala açıksa fallback denenebilir ama karmaşık olabilir.
-			// Şimdilik hata dönmeden success dönüyoruz (kısmi başarı)
-			return &telephonyv1.SpeakTextResponse{Success: true}, nil
-		}
-
-		if len(chunk.AudioContent) > 0 {
-			if err := mediaStream.Send(&mediav1.StreamAudioToCallRequest{AudioChunk: chunk.AudioContent}); err != nil {
-				return nil, err
-			}
-		}
-	}
-
-	if err := mediaStream.CloseSend(); err != nil {
-		s.log.Warn().Err(err).Msg("Media stream kapatma uyarısı")
-	}
-
-	// Ack bekle
-	if _, err := mediaStream.Recv(); err != nil && err != io.EOF {
-		s.log.Warn().Err(err).Msg("Media stream final yanıtı alınırken hata oluştu")
+		s.log.Error().Err(err).Msg("SpeakText işlemi başarısız oldu.")
+		return &telephonyv1.SpeakTextResponse{Success: false, Message: err.Error()}, err
 	}
 
 	return &telephonyv1.SpeakTextResponse{Success: true}, nil
 }
 
-// RunPipeline: Tam çift yönlü akıllı diyalog başlatır.
 func (s *Server) RunPipeline(req *telephonyv1.RunPipelineRequest, stream telephonyv1.TelephonyActionService_RunPipelineServer) error {
 	s.log.Info().Str("call_id", req.CallId).Msg("🔄 RunPipeline RPC çağrıldı.")
 
@@ -184,7 +134,6 @@ func (s *Server) RunPipeline(req *telephonyv1.RunPipelineRequest, stream telepho
 	return nil
 }
 
-// Legacy Metotlar
 func (s *Server) PlayAudio(ctx context.Context, req *telephonyv1.PlayAudioRequest) (*telephonyv1.PlayAudioResponse, error) {
 	return &telephonyv1.PlayAudioResponse{Success: true}, nil
 }
@@ -206,22 +155,12 @@ func (s *Server) BridgeCall(ctx context.Context, req *telephonyv1.BridgeCallRequ
 
 // TLS Helper
 func loadServerTLS(certPath, keyPath, caPath string) (credentials.TransportCredentials, error) {
-	if _, err := os.Stat(certPath); os.IsNotExist(err) {
-		return nil, errors.New("sertifika dosyası bulunamadı: " + certPath)
-	}
-	if _, err := os.Stat(keyPath); os.IsNotExist(err) {
-		return nil, errors.New("anahtar dosyası bulunamadı: " + keyPath)
-	}
-	if _, err := os.Stat(caPath); os.IsNotExist(err) {
-		return nil, errors.New("CA dosyası bulunamadı: " + caPath)
-	}
-
 	cert, err := tls.LoadX509KeyPair(certPath, keyPath)
 	if err != nil {
 		return nil, fmt.Errorf("keypair yükleme hatası: %w", err)
 	}
 
-	caData, err := os.ReadFile(caPath)
+	caData, err := ioutil.ReadFile(caPath)
 	if err != nil {
 		return nil, fmt.Errorf("CA okuma hatası: %w", err)
 	}

@@ -42,19 +42,29 @@ func NewClients(cfg *config.Config) (*Clients, error) {
 
 	// Bağlantıları oluştur
 	mediaConn, err := connect(cfg.MediaServiceURL, "media-service", tlsCreds)
-	if err != nil { return nil, fmt.Errorf("media connection failed: %w", err) }
+	if err != nil {
+		return nil, fmt.Errorf("media connection failed: %w", err)
+	}
 
 	sttConn, err := connect(cfg.SttGatewayURL, "stt-gateway-service", tlsCreds)
-	if err != nil { return nil, fmt.Errorf("stt connection failed: %w", err) }
+	if err != nil {
+		return nil, fmt.Errorf("stt connection failed: %w", err)
+	}
 
 	ttsConn, err := connect(cfg.TtsGatewayURL, "tts-gateway-service", tlsCreds)
-	if err != nil { return nil, fmt.Errorf("tts connection failed: %w", err) }
+	if err != nil {
+		return nil, fmt.Errorf("tts connection failed: %w", err)
+	}
 
 	dialogConn, err := connect(cfg.DialogServiceURL, "dialog-service", tlsCreds)
-	if err != nil { return nil, fmt.Errorf("dialog connection failed: %w", err) }
+	if err != nil {
+		return nil, fmt.Errorf("dialog connection failed: %w", err)
+	}
 
 	sipConn, err := connect(cfg.SipSignalingURL, "sip-signaling-service", tlsCreds)
-	if err != nil { return nil, fmt.Errorf("sip connection failed: %w", err) }
+	if err != nil {
+		return nil, fmt.Errorf("sip connection failed: %w", err)
+	}
 
 	log.Info().Msg("✅ Tüm gRPC istemcileri hazır.")
 
@@ -69,7 +79,7 @@ func NewClients(cfg *config.Config) (*Clients, error) {
 
 func connect(targetURL string, serverName string, tlsCreds credentials.TransportCredentials) (*grpc.ClientConn, error) {
 	var opts []grpc.DialOption
-	
+
 	// [FIX] URL Sanitization: strings paketini kullanarak http/https ön eklerini temizle.
 	// Go gRPC client, target olarak "host:port" formatını bekler, şema istemez.
 	cleanTarget := targetURL
@@ -103,14 +113,20 @@ func connect(targetURL string, serverName string, tlsCreds credentials.Transport
 
 func loadClientTLS(certPath, keyPath, caPath string) (credentials.TransportCredentials, error) {
 	// Dosya varlık kontrolü
-	if _, err := os.Stat(certPath); os.IsNotExist(err) { return nil, err }
-	
+	if _, err := os.Stat(certPath); os.IsNotExist(err) {
+		return nil, err
+	}
+
 	// Sertifikaları oku
 	cert, err := tls.LoadX509KeyPair(certPath, keyPath)
-	if err != nil { return nil, err }
+	if err != nil {
+		return nil, err
+	}
 
 	caPem, err := os.ReadFile(caPath)
-	if err != nil { return nil, err }
+	if err != nil {
+		return nil, err
+	}
 
 	certPool := x509.NewCertPool()
 	if !certPool.AppendCertsFromPEM(caPem) {
