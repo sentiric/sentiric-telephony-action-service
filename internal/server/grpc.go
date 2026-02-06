@@ -11,9 +11,7 @@ import (
 	"net"
 
 	"github.com/rs/zerolog"
-
 	eventv1 "github.com/sentiric/sentiric-contracts/gen/go/sentiric/event/v1"
-	mediav1 "github.com/sentiric/sentiric-contracts/gen/go/sentiric/media/v1"
 	telephonyv1 "github.com/sentiric/sentiric-contracts/gen/go/sentiric/telephony/v1"
 
 	"github.com/sentiric/sentiric-telephony-action-service/internal/client"
@@ -24,7 +22,6 @@ import (
 	"google.golang.org/grpc/credentials"
 )
 
-// KRİTİK DÜZELTME: Server struct tanımı eklendi (Hata 4, 5)
 type Server struct {
 	telephonyv1.UnimplementedTelephonyActionServiceServer
 	pipelineManager *service.PipelineManager
@@ -32,17 +29,13 @@ type Server struct {
 	log             zerolog.Logger
 }
 
-// KRİTİK DÜZELTME: NewGrpcServer tanımı eklendi (Hata 1)
 func NewGrpcServer(cfg *config.Config, log zerolog.Logger, clients *client.Clients) *grpc.Server {
 	var opts []grpc.ServerOption
 
 	if cfg.CertPath != "" {
 		creds, err := loadServerTLS(cfg.CertPath, cfg.KeyPath, cfg.CaPath)
-		if err != nil {
-			log.Error().Err(err).Msg("TLS yüklenemedi, INSECURE moduna geçiliyor.")
-		} else {
+		if err == nil {
 			opts = append(opts, grpc.Creds(creds))
-			log.Info().Msg("🔒 gRPC Server mTLS ile güvenli başlatılıyor.")
 		}
 	}
 
@@ -59,81 +52,64 @@ func NewGrpcServer(cfg *config.Config, log zerolog.Logger, clients *client.Clien
 	return grpcServer
 }
 
-// KRİTİK DÜZELTME: Start fonksiyonu eklendi (Hata 2)
 func Start(grpcServer *grpc.Server, port string) error {
 	lis, err := net.Listen("tcp", fmt.Sprintf(":%s", port))
 	if err != nil {
-		return fmt.Errorf("failed to listen: %w", err)
+		return err
 	}
 	return grpcServer.Serve(lis)
 }
 
-// KRİTİK DÜZELTME: Stop fonksiyonu eklendi (Hata 3)
 func Stop(grpcServer *grpc.Server) {
 	grpcServer.GracefulStop()
 }
 
-// --- RPC IMPLEMENTATIONS ---
-
+// SpeakText: Unary RPC.
 func (s *Server) SpeakText(ctx context.Context, req *telephonyv1.SpeakTextRequest) (*telephonyv1.SpeakTextResponse, error) {
-	s.log.Info().Str("call_id", req.CallId).Msg("📢 SpeakText isteği alındı.")
+	s.log.Info().Str("call_id", req.CallId).Msg("📢 SpeakText RPC")
 
-	mediaInfo := req.GetMediaInfo()
-	if mediaInfo == nil {
-		return nil, errors.New("media_info alanı boş olamaz")
+	if req.MediaInfo == nil {
+		return nil, errors.New("media_info required")
 	}
 
-	holePunchReq := &mediav1.PlayAudioRequest{
-		AudioUri:      "file://audio/tr/system/nat_warmer.wav",
-		ServerRtpPort: mediaInfo.GetServerRtpPort(),
-		RtpTargetAddr: mediaInfo.GetCallerRtpAddr(),
+	// Tip dönüşümü (telephonyv1.MediaInfo -> eventv1.MediaInfo)
+	internalMedia := &eventv1.MediaInfo{
+		CallerRtpAddr: req.MediaInfo.CallerRtpAddr,
+		ServerRtpPort: req.MediaInfo.ServerRtpPort,
 	}
 
-	_, err := s.mediator.Clients.Media.PlayAudio(ctx, holePunchReq)
+	err := s.mediator.SpeakText(ctx, req.CallId, req.Text, req.VoiceId, internalMedia)
 	if err != nil {
-		s.log.Warn().Err(err).Msg("Hole Punching komutu gönderilemedi, ses gelmeyebilir.")
-	}
-
-	eventMediaInfo := &eventv1.MediaInfo{
-		CallerRtpAddr: mediaInfo.GetCallerRtpAddr(),
-		ServerRtpPort: mediaInfo.GetServerRtpPort(),
-	}
-
-	err = s.mediator.SpeakText(
-		ctx,
-		req.CallId,
-		req.Text,
-		req.VoiceId,
-		eventMediaInfo,
-	)
-
-	if err != nil {
-		s.log.Error().Err(err).Msg("SpeakText işlemi başarısız oldu.")
-		return &telephonyv1.SpeakTextResponse{Success: false, Message: err.Error()}, err
+		return &telephonyv1.SpeakTextResponse{Success: false}, err
 	}
 
 	return &telephonyv1.SpeakTextResponse{Success: true}, nil
 }
 
+// RunPipeline: Streaming RPC.
 func (s *Server) RunPipeline(req *telephonyv1.RunPipelineRequest, stream telephonyv1.TelephonyActionService_RunPipelineServer) error {
-	s.log.Info().Str("call_id", req.CallId).Msg("🔄 RunPipeline RPC çağrıldı.")
+	s.log.Info().Str("call_id", req.CallId).Msg("🔄 RunPipeline RPC")
 
-	err := s.pipelineManager.RunPipeline(
+	if req.MediaInfo == nil {
+		return errors.New("media_info required in request")
+	}
+
+	// Tip dönüşümü
+	internalMedia := &eventv1.MediaInfo{
+		CallerRtpAddr: req.MediaInfo.CallerRtpAddr,
+		ServerRtpPort: req.MediaInfo.ServerRtpPort,
+	}
+
+	return s.pipelineManager.RunPipeline(
 		stream.Context(),
 		req.CallId,
 		req.SessionId,
 		"unknown_user",
-		req.MediaInfo.ServerRtpPort,
+		internalMedia, // DÜZELTME: Artık *eventv1.MediaInfo tipinde geçiliyor
 	)
-
-	if err != nil {
-		s.log.Error().Err(err).Msg("Pipeline hata ile sonlandı")
-		return err
-	}
-
-	return nil
 }
 
+// Legacy / Not implemented stubs
 func (s *Server) PlayAudio(ctx context.Context, req *telephonyv1.PlayAudioRequest) (*telephonyv1.PlayAudioResponse, error) {
 	return &telephonyv1.PlayAudioResponse{Success: true}, nil
 }
@@ -153,23 +129,17 @@ func (s *Server) BridgeCall(ctx context.Context, req *telephonyv1.BridgeCallRequ
 	return &telephonyv1.BridgeCallResponse{Success: true}, nil
 }
 
-// TLS Helper
 func loadServerTLS(certPath, keyPath, caPath string) (credentials.TransportCredentials, error) {
 	cert, err := tls.LoadX509KeyPair(certPath, keyPath)
 	if err != nil {
-		return nil, fmt.Errorf("keypair yükleme hatası: %w", err)
+		return nil, err
 	}
-
 	caData, err := ioutil.ReadFile(caPath)
 	if err != nil {
-		return nil, fmt.Errorf("CA okuma hatası: %w", err)
+		return nil, err
 	}
-
 	pool := x509.NewCertPool()
-	if !pool.AppendCertsFromPEM(caData) {
-		return nil, errors.New("CA sertifikası havuza eklenemedi")
-	}
-
+	pool.AppendCertsFromPEM(caData)
 	return credentials.NewTLS(&tls.Config{
 		Certificates: []tls.Certificate{cert},
 		ClientAuth:   tls.RequireAndVerifyClientCert,

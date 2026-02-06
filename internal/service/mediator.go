@@ -5,7 +5,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"os"
 
 	"github.com/rs/zerolog"
 	eventv1 "github.com/sentiric/sentiric-contracts/gen/go/sentiric/event/v1"
@@ -14,9 +13,8 @@ import (
 	"github.com/sentiric/sentiric-telephony-action-service/internal/client"
 )
 
-// Mediator, Media ve TTS gibi dış servisleri orkestre eden yardımcı fonksiyonları içerir.
 type Mediator struct {
-	Clients *client.Clients // KRİTİK DÜZELTME: Clients yapıldı
+	Clients *client.Clients
 	log     zerolog.Logger
 }
 
@@ -24,90 +22,76 @@ func NewMediator(clients *client.Clients, log zerolog.Logger) *Mediator {
 	return &Mediator{Clients: clients, log: log}
 }
 
-// SpeakText: Metni sese çevirir ve medya servisine stream eder (Bloklayıcı).
-// mediaInfo parametresi eventv1.MediaInfo tipinde olmalıdır.
+// SpeakText: gRPC ve Pipeline tarafından ortak kullanılan seslendirme motoru.
+// Bu fonksiyon context iptali ile "Barge-in" (Söz Kesme) desteği sunar.
 func (m *Mediator) SpeakText(ctx context.Context, callID, text, voiceID string, mediaInfo *eventv1.MediaInfo) error {
 	l := m.log.With().Str("call_id", callID).Logger()
-	l.Debug().Str("text", text).Msg("📢 SpeakText: TTS Stream Başlatılıyor")
 
-	// 1. Media Bağlantısı (Outbound Audio Stream)
-	mediaStream, err := m.Clients.Media.StreamAudioToCall(ctx)
-	if err != nil {
-		return fmt.Errorf("media stream açılamadı: %w", err)
-	}
-	if err := mediaStream.Send(&mediav1.StreamAudioToCallRequest{CallId: callID}); err != nil {
-		return fmt.Errorf("media stream el sıkışma hatası: %w", err)
-	}
-
-	// 2. TTS İsteği (Stream)
+	// 1. TTS İstek Hazırlığı
 	ttsReq := &ttsv1.SynthesizeStreamRequest{
-		Text:        text,
-		VoiceId:     voiceID,
-		AudioConfig: &ttsv1.AudioConfig{SampleRateHertz: 16000, AudioFormat: ttsv1.AudioFormat_AUDIO_FORMAT_PCM_S16LE},
+		Text:    text,
+		VoiceId: voiceID,
+		AudioConfig: &ttsv1.AudioConfig{
+			SampleRateHertz: 16000,
+			AudioFormat:     ttsv1.AudioFormat_AUDIO_FORMAT_PCM_S16LE,
+		},
 	}
+
+	// 2. TTS Stream'i Başlat
 	ttsStream, err := m.Clients.TTS.SynthesizeStream(ctx, ttsReq)
 	if err != nil {
-		l.Error().Err(err).Msg("❌ TTS Stream Başarısız, Fallback Deneniyor.")
-		return m.handleTTSFallback(mediaStream, callID)
+		l.Error().Err(err).Msg("❌ TTS Stream başlatılamadı.")
+		return err
 	}
 
-	// 3. Loop: TTS -> Media
-	for {
-		chunk, err := ttsStream.Recv()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			l.Error().Err(err).Msg("❌ TTS stream kesintisi.")
-			break
-		}
+	// 3. Media Service Stream'i Başlat
+	mediaStream, err := m.Clients.Media.StreamAudioToCall(ctx)
+	if err != nil {
+		return fmt.Errorf("media outbound stream hatası: %w", err)
+	}
 
-		if len(chunk.AudioContent) > 0 {
-			if err := mediaStream.Send(&mediav1.StreamAudioToCallRequest{AudioChunk: chunk.AudioContent}); err != nil {
-				return fmt.Errorf("media stream gönderme hatası: %w", err)
+	// Handshake: CallID gönder
+	if err := mediaStream.Send(&mediav1.StreamAudioToCallRequest{CallId: callID}); err != nil {
+		return fmt.Errorf("media handshake failed: %w", err)
+	}
+
+	// 4. TX Loop: TTS -> Media
+	for {
+		select {
+		case <-ctx.Done():
+			l.Warn().Msg("🛑 TTS stream cancelled.")
+			return ctx.Err()
+		default:
+			chunk, err := ttsStream.Recv()
+			if err == io.EOF {
+				goto Finish
+			}
+			if err != nil {
+				return fmt.Errorf("tts recv error: %w", err)
+			}
+
+			if len(chunk.AudioContent) > 0 {
+				if err := mediaStream.Send(&mediav1.StreamAudioToCallRequest{AudioChunk: chunk.AudioContent}); err != nil {
+					return fmt.Errorf("media send error: %w", err)
+				}
 			}
 		}
 	}
 
-	if err := mediaStream.CloseSend(); err != nil {
-		l.Warn().Err(err).Msg("Media stream kapatma uyarısı")
-	}
-
-	if _, err := mediaStream.Recv(); err != nil && err != io.EOF {
-		l.Warn().Err(err).Msg("Media stream final yanıtı alınırken hata oluştu")
-	}
-
-	l.Debug().Msg("✅ SpeakText tamamlandı.")
+Finish:
+	_ = mediaStream.CloseSend()
+	_, _ = mediaStream.Recv() // Final ACK
 	return nil
 }
 
-// handleTTSFallback: TTS başarısız olursa önceden kaydedilmiş anonsu çalar.
-func (m *Mediator) handleTTSFallback(mediaStream mediav1.MediaService_StreamAudioToCallClient, callID string) error {
-	fallbackPath := "/sentiric-assets/audio/tr/system/technical_difficulty.wav"
-	l := m.log.With().Str("call_id", callID).Logger()
-
-	file, fErr := os.Open(fallbackPath)
-	if fErr != nil {
-		return fmt.Errorf("TTS başarısız ve fallback dosyası açılamadı: %w", fErr)
+func (m *Mediator) TriggerHolePunching(ctx context.Context, mediaInfo *eventv1.MediaInfo) {
+	if mediaInfo.GetCallerRtpAddr() == "" {
+		return
 	}
-	defer file.Close()
-
-	buf := make([]byte, 1024)
-	for {
-		n, rErr := file.Read(buf)
-		if n > 0 {
-			if err := mediaStream.Send(&mediav1.StreamAudioToCallRequest{AudioChunk: buf[:n]}); err != nil {
-				return fmt.Errorf("fallback audio gönderme hatası: %w", err)
-			}
-		}
-		if rErr == io.EOF {
-			break
-		}
-		if rErr != nil {
-			return fmt.Errorf("fallback dosya okuma hatası: %w", rErr)
-		}
+	req := &mediav1.PlayAudioRequest{
+		AudioUri:      "file://audio/tr/system/nat_warmer.wav",
+		ServerRtpPort: mediaInfo.GetServerRtpPort(),
+		RtpTargetAddr: mediaInfo.GetCallerRtpAddr(),
 	}
-
-	l.Info().Msg("✅ Fallback audio çalındı.")
-	return mediaStream.CloseSend()
+	_, _ = m.Clients.Media.PlayAudio(ctx, req)
 }
