@@ -32,26 +32,35 @@ func NewPipelineManager(clients *client.Clients, log zerolog.Logger) *PipelineMa
 func (pm *PipelineManager) RunPipeline(ctx context.Context, callID, sessionID, userID string, mediaInfo *eventv1.MediaInfo) error {
 	l := pm.log.With().Str("call_id", callID).Str("trace_id", sessionID).Logger()
 
+	// 1. Trace ID Propagation
 	md := metadata.Pairs("x-trace-id", sessionID)
 	outCtx := metadata.NewOutgoingContext(ctx, md)
 
+	// 2. [NAT TRAVERSAL]: Hole Punching tetikle (v1.15.0 standardı)
 	pm.mediator.TriggerHolePunching(outCtx, mediaInfo)
 
-	mediaRecStream, err := pm.clients.Media.RecordAudio(outCtx, &mediav1.RecordAudioRequest{ServerRtpPort: mediaInfo.GetServerRtpPort()})
+	// 3. Media Recording (Inbound) Stream
+	mediaRecStream, err := pm.clients.Media.RecordAudio(outCtx, &mediav1.RecordAudioRequest{
+		ServerRtpPort:    mediaInfo.GetServerRtpPort(),
+		TargetSampleRate: toPtrUint32(16000), // STT için 16k zorla
+	})
 	if err != nil {
 		return err
 	}
 
+	// 4. STT Gateway Stream
 	sttStream, err := pm.clients.STT.TranscribeStream(outCtx)
 	if err != nil {
 		return err
 	}
 
+	// 5. Dialog Service Stream
 	dialogStream, err := pm.clients.Dialog.StreamConversation(outCtx)
 	if err != nil {
 		return err
 	}
 
+	// Init Dialog
 	_ = dialogStream.Send(&dialogv1.StreamConversationRequest{
 		Payload: &dialogv1.StreamConversationRequest_Config{
 			Config: &dialogv1.ConversationConfig{SessionId: sessionID, UserId: userID},
@@ -63,7 +72,7 @@ func (pm *PipelineManager) RunPipeline(ctx context.Context, callID, sessionID, u
 	wg := &sync.WaitGroup{}
 	errChan := make(chan error, 5)
 
-	// RX Loop
+	// --- RX LOOP (Media -> STT) ---
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -76,11 +85,15 @@ func (pm *PipelineManager) RunPipeline(ctx context.Context, callID, sessionID, u
 				errChan <- err
 				return
 			}
-			_ = sttStream.Send(&sttv1.TranscribeStreamRequest{AudioChunk: chunk.AudioData})
+
+			if err := sttStream.Send(&sttv1.TranscribeStreamRequest{AudioChunk: chunk.AudioData}); err != nil {
+				l.Warn().Err(err).Msg("STT stream send error.")
+				return
+			}
 		}
 	}()
 
-	// STT Process Loop
+	// --- STT PROCESS LOOP (STT -> Dialog & Barge-in) ---
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -94,17 +107,19 @@ func (pm *PipelineManager) RunPipeline(ctx context.Context, callID, sessionID, u
 				return
 			}
 
+			// [BARGE-IN LOGIC]: Kullanıcı konuşmaya başladıysa mevcut TTS'i kes.
 			if !res.IsFinal && len(res.PartialTranscription) > 3 {
 				ttsMutex.Lock()
 				if ttsCancelFunc != nil {
-					l.Warn().Msg("🔇 Barge-in detected.")
-					ttsCancelFunc()
+					l.Warn().Str("partial", res.PartialTranscription).Msg("🔇 Barge-in detected. Cancelling TTS.")
+					ttsCancelFunc() // TTS context'ini iptal et
 					ttsCancelFunc = nil
 				}
 				ttsMutex.Unlock()
 			}
 
 			if res.IsFinal {
+				l.Info().Str("transcript", res.PartialTranscription).Msg("🗣️ User final utterance.")
 				_ = dialogStream.Send(&dialogv1.StreamConversationRequest{
 					Payload: &dialogv1.StreamConversationRequest_TextInput{TextInput: res.PartialTranscription},
 				})
@@ -115,7 +130,7 @@ func (pm *PipelineManager) RunPipeline(ctx context.Context, callID, sessionID, u
 		}
 	}()
 
-	// TX Loop
+	// --- TX LOOP (Dialog -> TTS -> Media) ---
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -134,17 +149,20 @@ func (pm *PipelineManager) RunPipeline(ctx context.Context, callID, sessionID, u
 				continue
 			}
 
+			// Her cümle için yeni bir iptal edilebilir context
 			ttsCtx, tCancel := context.WithCancel(outCtx)
 			ttsMutex.Lock()
 			ttsCancelFunc = tCancel
 			ttsMutex.Unlock()
 
+			// Mediator üzerinden seslendir
 			if err := pm.mediator.SpeakText(ttsCtx, callID, sentence, "coqui:default", mediaInfo); err != nil {
-				l.Debug().Err(err).Msg("TTS stream inactive.")
+				l.Debug().Err(err).Msg("TTS/Media playback interrupted or failed.")
 			}
 		}
 	}()
 
+	// Cleanup
 	select {
 	case <-ctx.Done():
 		return nil
@@ -152,3 +170,5 @@ func (pm *PipelineManager) RunPipeline(ctx context.Context, callID, sessionID, u
 		return err
 	}
 }
+
+func toPtrUint32(v uint32) *uint32 { return &v }
