@@ -12,20 +12,24 @@ import (
 	mediav1 "github.com/sentiric/sentiric-contracts/gen/go/sentiric/media/v1"
 	sttv1 "github.com/sentiric/sentiric-contracts/gen/go/sentiric/stt/v1"
 	"github.com/sentiric/sentiric-telephony-action-service/internal/client"
+	"github.com/sentiric/sentiric-telephony-action-service/internal/config" // Config import edildi
 	"google.golang.org/grpc/metadata"
 )
 
 type PipelineManager struct {
 	clients  *client.Clients
+	config   *config.Config // Config struct'a eklendi
 	log      zerolog.Logger
 	mediator *Mediator
 }
 
-func NewPipelineManager(clients *client.Clients, log zerolog.Logger) *PipelineManager {
+// NewPipelineManager: Config parametresi eklendi ve Mediator'a geçirildi.
+func NewPipelineManager(clients *client.Clients, cfg *config.Config, log zerolog.Logger) *PipelineManager {
 	return &PipelineManager{
 		clients:  clients,
+		config:   cfg,
 		log:      log,
-		mediator: NewMediator(clients, log),
+		mediator: NewMediator(clients, cfg, log), // Config Mediator'a iletiliyor
 	}
 }
 
@@ -36,13 +40,18 @@ func (pm *PipelineManager) RunPipeline(ctx context.Context, callID, sessionID, u
 	md := metadata.Pairs("x-trace-id", sessionID)
 	outCtx := metadata.NewOutgoingContext(ctx, md)
 
-	// 2. [NAT TRAVERSAL]: Hole Punching tetikle (v1.15.0 standardı)
+	// 2. [NAT TRAVERSAL]: Hole Punching tetikle
 	pm.mediator.TriggerHolePunching(outCtx, mediaInfo)
 
+	// [MİMARİ DÜZELTME]: Hardcoded 16000 yerine Config kullanılıyor.
+	// STT motoru için ideal örnekleme hızı buradan belirlenir.
+	targetSampleRate := uint32(pm.config.PipelineSampleRate)
+
 	// 3. Media Recording (Inbound) Stream
+	l.Debug().Uint32("target_sr", targetSampleRate).Msg("Media Service inbound stream başlatılıyor...")
 	mediaRecStream, err := pm.clients.Media.RecordAudio(outCtx, &mediav1.RecordAudioRequest{
 		ServerRtpPort:    mediaInfo.GetServerRtpPort(),
-		TargetSampleRate: toPtrUint32(16000), // STT için 16k zorla
+		TargetSampleRate: toPtrUint32(targetSampleRate), // ARTIK HARDCODED DEĞİL
 	})
 	if err != nil {
 		return err
@@ -156,6 +165,7 @@ func (pm *PipelineManager) RunPipeline(ctx context.Context, callID, sessionID, u
 			ttsMutex.Unlock()
 
 			// Mediator üzerinden seslendir
+			// Config'den gelen sample rate burada otomatik kullanılıyor (Mediator içinde)
 			if err := pm.mediator.SpeakText(ttsCtx, callID, sentence, "coqui:default", mediaInfo); err != nil {
 				l.Debug().Err(err).Msg("TTS/Media playback interrupted or failed.")
 			}

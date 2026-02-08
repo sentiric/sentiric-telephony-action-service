@@ -39,8 +39,10 @@ func NewGrpcServer(cfg *config.Config, log zerolog.Logger, clients *client.Clien
 		}
 	}
 
-	pipelineMgr := service.NewPipelineManager(clients, log)
-	mediator := service.NewMediator(clients, log)
+	// [DÜZELTME]: Parametre sayısı artık doğru. Config (cfg) enjekte edildi.
+	pipelineMgr := service.NewPipelineManager(clients, cfg, log)
+	mediator := service.NewMediator(clients, cfg, log)
+
 	grpcServer := grpc.NewServer(opts...)
 
 	telephonyv1.RegisterTelephonyActionServiceServer(grpcServer, &Server{
@@ -105,7 +107,7 @@ func (s *Server) RunPipeline(req *telephonyv1.RunPipelineRequest, stream telepho
 		req.CallId,
 		req.SessionId,
 		"unknown_user",
-		internalMedia, // DÜZELTME: Artık *eventv1.MediaInfo tipinde geçiliyor
+		internalMedia,
 	)
 }
 

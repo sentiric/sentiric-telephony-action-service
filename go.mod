@@ -5,8 +5,8 @@ go 1.24.5
 require (
 	github.com/joho/godotenv v1.5.1
 	github.com/rs/zerolog v1.34.0
-	// GÜNCELLEME: v1.15.0
-	github.com/sentiric/sentiric-contracts v1.15.0
+	// GÜNCELLEME: v1.16.0 (Tuning & SampleRate Kontrolü)
+	github.com/sentiric/sentiric-contracts v1.16.0
 	google.golang.org/grpc v1.75.1
 )
 

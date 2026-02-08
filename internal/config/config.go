@@ -3,6 +3,7 @@ package config
 
 import (
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/joho/godotenv"
@@ -10,13 +11,13 @@ import (
 )
 
 type Config struct {
-	Env         string
-	LogLevel    string
+	Env            string
+	LogLevel       string
 	ServiceVersion string
 
 	// Server
-	GRPCPort string
-	HttpPort string
+	GRPCPort    string
+	HttpPort    string
 	MetricsPort string
 
 	// Security (mTLS)
@@ -25,15 +26,26 @@ type Config struct {
 	CaPath   string
 
 	// Dependencies (Gateways)
-	MediaServiceURL    string
-	SttGatewayURL      string
-	TtsGatewayURL      string
-	DialogServiceURL   string
-	SipSignalingURL    string
+	MediaServiceURL  string
+	SttGatewayURL    string
+	TtsGatewayURL    string
+	DialogServiceURL string
+	SipSignalingURL  string
+
+	// Audio Pipeline Settings (YENİ)
+	PipelineSampleRate int32 // Varsayılan: 16000
 }
 
 func Load() (*Config, error) {
-	_ = godotenv.Load() // .env varsa yükle, yoksa environment'a güven
+	_ = godotenv.Load()
+
+	// Pipeline Sample Rate: Ortamdan oku veya 16000 yap.
+	srStr := getEnv("PIPELINE_SAMPLE_RATE", "16000")
+	sr, err := strconv.Atoi(srStr)
+	if err != nil {
+		sr = 16000
+		log.Warn().Msg("Geçersiz PIPELINE_SAMPLE_RATE, varsayılan 16000Hz kullanılıyor.")
+	}
 
 	cfg := &Config{
 		Env:            getEnv("ENV", "production"),
@@ -53,6 +65,8 @@ func Load() (*Config, error) {
 		TtsGatewayURL:    fixUrl(getEnv("TTS_GATEWAY_TARGET_GRPC_URL", "tts-gateway-service:14011")),
 		DialogServiceURL: fixUrl(getEnv("DIALOG_SERVICE_TARGET_GRPC_URL", "dialog-service:12061")),
 		SipSignalingURL:  fixUrl(getEnv("SIP_SIGNALING_TARGET_GRPC_URL", "sip-signaling-service:13021")),
+
+		PipelineSampleRate: int32(sr),
 	}
 
 	return cfg, nil
@@ -73,7 +87,6 @@ func getEnvOrFail(key string) string {
 	return ""
 }
 
-// fixUrl: gRPC bağlantıları için http/https ön ekini temizler (Go gRPC client için gerekli)
 func fixUrl(url string) string {
 	if strings.Contains(url, "://") {
 		parts := strings.Split(url, "://")
