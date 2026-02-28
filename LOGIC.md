@@ -1,36 +1,41 @@
-# 📞 Sentiric Telephony Action Service - Mantık Mimarisi (Final)
+# 📞 Sentiric Telephony Action Service - Mantık Mimarisi (v3.0)
 
-**Rol:** İcra Memuru. Yüksek seviyeli "Konuş" emrini, düşük seviyeli "Stream" işlemine çevirir.
+**Rol:** Ağır İşçi / Boru Hattı Yöneticisi (Pipeline Manager).
+Agent Service'ten aldığı yüksek seviyeli emirleri (Örn: "AI Döngüsünü Başlat"), düşük seviyeli Gateway stream'lerine çevirir.
 
-## 1. Görev Akışı (SpeakText)
+## 1. Görev Akışı (RunPipeline - Full Duplex)
 
-Agent servisi sadece "Merhaba de" der. Bu servis şu karmaşık işi yapar:
-
-1.  **Sentez (TTS):** Metni `tts-gateway`'e gönderir.
-2.  **Akış (Stream):** TTS'ten gelen ses parçalarını (chunks) anlık olarak yakalar.
-3.  **İletim (Media):** Yakaladığı parçaları `media-service`'in gRPC kanalına basar.
-4.  **Senkronizasyon:** Cümle bitene kadar Agent'ı bekletir (Block), bitince "Tamam" döner.
-
-## 2. Akış Diyagramı
+Bu servis, platformun en yoğun akan (Streaming) verilerini koordine eder. Bir `RunPipeline` emri geldiğinde şu asenkron mimariyi kurar:
 
 ```mermaid
 sequenceDiagram
-    participant Agent
+    participant Media as Media Service (RTP)
     participant TAS as Telephony Action
-    participant TTS
-    participant Media
+    participant STT as STT Gateway
+    participant Dialog as Dialog Service
+    participant TTS as TTS Gateway
 
-    Agent->>TAS: SpeakText("Merhaba")
-    
-    par Parallel Processing
-        TAS->>TTS: SynthesizeStream("Merhaba")
-        loop Audio Chunks
-            TTS-->>TAS: [Chunk 1, Chunk 2...]
-            TAS->>Media: StreamAudio([Chunk...])
-        end
+    par Eşzamanlı Stream İşleme
+        %% İçe Akış (Duyma)
+        Media-->>TAS: Audio Stream (Rx)
+        TAS-->>STT: Audio Stream
+        STT-->>TAS: Transcribed Text (Partial/Final)
+        
+        %% Beyin (Düşünme)
+        TAS-->>Dialog: Text Input
+        Dialog-->>TAS: AI Text Response (Stream)
+        
+        %% Dışa Akış (Konuşma)
+        TAS-->>TTS: Text Stream
+        TTS-->>TAS: Audio Stream
+        TAS-->>Media: Audio Stream (Tx)
     end
-    
-    TAS-->>Agent: Success (Cümle Bitti)
 ```
+
+## 2. Kritik Özellikler
+
+1.  **Barge-in (Söz Kesme) Mantığı:** STT Gateway'den gelen seste "Kullanıcı konuşuyor" sinyali (Partial Transcript) alındığında, TAS derhal TTS'ten Media'ya giden akışı keser (Cancel Context). Böylece AI susar ve dinlemeye başlar.
+2.  **Agnostik Gateway Kullanımı:** Hangi LLM (Llama/Gemini) veya hangi STT (Whisper/Deepgram) kullanıldığını bilmez. Sadece Standart Sentiric Protobuf kontratları üzerinden `*-gateway-service`'leri ile konuşur.
+3.  **Media İzolasyonu:** RTP paketlerine veya UDP soketlerine dokunmaz. Media Service ile gRPC stream üzerinden ham PCM ses verisi alıp verir.
 
 ---
