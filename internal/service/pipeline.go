@@ -12,24 +12,23 @@ import (
 	mediav1 "github.com/sentiric/sentiric-contracts/gen/go/sentiric/media/v1"
 	sttv1 "github.com/sentiric/sentiric-contracts/gen/go/sentiric/stt/v1"
 	"github.com/sentiric/sentiric-telephony-action-service/internal/client"
-	"github.com/sentiric/sentiric-telephony-action-service/internal/config" // Config import edildi
+	"github.com/sentiric/sentiric-telephony-action-service/internal/config"
 	"google.golang.org/grpc/metadata"
 )
 
 type PipelineManager struct {
 	clients  *client.Clients
-	config   *config.Config // Config struct'a eklendi
+	config   *config.Config
 	log      zerolog.Logger
 	mediator *Mediator
 }
 
-// NewPipelineManager: Config parametresi eklendi ve Mediator'a geçirildi.
 func NewPipelineManager(clients *client.Clients, cfg *config.Config, log zerolog.Logger) *PipelineManager {
 	return &PipelineManager{
 		clients:  clients,
 		config:   cfg,
 		log:      log,
-		mediator: NewMediator(clients, cfg, log), // Config Mediator'a iletiliyor
+		mediator: NewMediator(clients, cfg, log),
 	}
 }
 
@@ -40,36 +39,32 @@ func (pm *PipelineManager) RunPipeline(ctx context.Context, callID, sessionID, u
 	md := metadata.Pairs("x-trace-id", sessionID)
 	outCtx := metadata.NewOutgoingContext(ctx, md)
 
-	// 2. [NAT TRAVERSAL]: Hole Punching tetikle
-	pm.mediator.TriggerHolePunching(outCtx, mediaInfo)
+	// NAT Warmer çağrısı kaldırıldı. Media Service artık SetTargetAddress anında bunu otonom yapar.
 
-	// [MİMARİ DÜZELTME]: Hardcoded 16000 yerine Config kullanılıyor.
-	// STT motoru için ideal örnekleme hızı buradan belirlenir.
 	targetSampleRate := uint32(pm.config.PipelineSampleRate)
 
-	// 3. Media Recording (Inbound) Stream
+	// 2. Media Recording (Inbound) Stream
 	l.Debug().Uint32("target_sr", targetSampleRate).Msg("Media Service inbound stream başlatılıyor...")
 	mediaRecStream, err := pm.clients.Media.RecordAudio(outCtx, &mediav1.RecordAudioRequest{
 		ServerRtpPort:    mediaInfo.GetServerRtpPort(),
-		TargetSampleRate: toPtrUint32(targetSampleRate), // ARTIK HARDCODED DEĞİL
+		TargetSampleRate: toPtrUint32(targetSampleRate),
 	})
 	if err != nil {
 		return err
 	}
 
-	// 4. STT Gateway Stream
+	// 3. STT Gateway Stream
 	sttStream, err := pm.clients.STT.TranscribeStream(outCtx)
 	if err != nil {
 		return err
 	}
 
-	// 5. Dialog Service Stream
+	// 4. Dialog Service Stream
 	dialogStream, err := pm.clients.Dialog.StreamConversation(outCtx)
 	if err != nil {
 		return err
 	}
 
-	// Init Dialog
 	_ = dialogStream.Send(&dialogv1.StreamConversationRequest{
 		Payload: &dialogv1.StreamConversationRequest_Config{
 			Config: &dialogv1.ConversationConfig{SessionId: sessionID, UserId: userID},
@@ -94,7 +89,6 @@ func (pm *PipelineManager) RunPipeline(ctx context.Context, callID, sessionID, u
 				errChan <- err
 				return
 			}
-
 			if err := sttStream.Send(&sttv1.TranscribeStreamRequest{AudioChunk: chunk.AudioData}); err != nil {
 				l.Warn().Err(err).Msg("STT stream send error.")
 				return
@@ -116,12 +110,12 @@ func (pm *PipelineManager) RunPipeline(ctx context.Context, callID, sessionID, u
 				return
 			}
 
-			// [BARGE-IN LOGIC]: Kullanıcı konuşmaya başladıysa mevcut TTS'i kes.
+			//[BARGE-IN LOGIC]
 			if !res.IsFinal && len(res.PartialTranscription) > 3 {
 				ttsMutex.Lock()
 				if ttsCancelFunc != nil {
 					l.Warn().Str("partial", res.PartialTranscription).Msg("🔇 Barge-in detected. Cancelling TTS.")
-					ttsCancelFunc() // TTS context'ini iptal et
+					ttsCancelFunc()
 					ttsCancelFunc = nil
 				}
 				ttsMutex.Unlock()
@@ -158,21 +152,17 @@ func (pm *PipelineManager) RunPipeline(ctx context.Context, callID, sessionID, u
 				continue
 			}
 
-			// Her cümle için yeni bir iptal edilebilir context
 			ttsCtx, tCancel := context.WithCancel(outCtx)
 			ttsMutex.Lock()
 			ttsCancelFunc = tCancel
 			ttsMutex.Unlock()
 
-			// Mediator üzerinden seslendir
-			// Config'den gelen sample rate burada otomatik kullanılıyor (Mediator içinde)
 			if err := pm.mediator.SpeakText(ttsCtx, callID, sentence, "coqui:default", mediaInfo); err != nil {
 				l.Debug().Err(err).Msg("TTS/Media playback interrupted or failed.")
 			}
 		}
 	}()
 
-	// Cleanup
 	select {
 	case <-ctx.Done():
 		return nil

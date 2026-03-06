@@ -16,11 +16,10 @@ import (
 
 type Mediator struct {
 	Clients *client.Clients
-	Config  *config.Config // Config eklendi
+	Config  *config.Config
 	log     zerolog.Logger
 }
 
-// NewMediator: Config parametresi eklendi.
 func NewMediator(clients *client.Clients, cfg *config.Config, log zerolog.Logger) *Mediator {
 	return &Mediator{
 		Clients: clients,
@@ -33,22 +32,17 @@ func NewMediator(clients *client.Clients, cfg *config.Config, log zerolog.Logger
 func (m *Mediator) SpeakText(ctx context.Context, callID, text, voiceID string, mediaInfo *eventv1.MediaInfo) error {
 	l := m.log.With().Str("call_id", callID).Logger()
 
-	// [MİMARİ DÜZELTME]: Hardcoded değer yerine Config'den gelen değer kullanılıyor.
-	// Bu değer hem TTS üretim hızını hem de Media Service'in beklediği hızı belirler.
 	targetSampleRate := m.Config.PipelineSampleRate
 
-	// 1. TTS İstek Hazırlığı (v1.16.0 UYUMLU)
+	// 1. TTS İstek Hazırlığı
 	ttsReq := &ttsv1.SynthesizeStreamRequest{
 		Text:    text,
 		VoiceId: voiceID,
-		// [ZORUNLU]: AudioConfig ile format ve hızı açıkça belirtiyoruz.
 		AudioConfig: &ttsv1.AudioConfig{
 			SampleRateHertz: targetSampleRate,
 			AudioFormat:     ttsv1.AudioFormat_AUDIO_FORMAT_PCM_S16LE,
 			VolumeGainDb:    0.0,
 		},
-		// [OPSİYONEL]: Sesin karakterini belirleyen ince ayarlar.
-		// İleride burası da Config'den gelebilir.
 		Tuning: &ttsv1.TuningParams{
 			Speed:             1.0,
 			Temperature:       0.75,
@@ -61,7 +55,7 @@ func (m *Mediator) SpeakText(ctx context.Context, callID, text, voiceID string, 
 	l.Debug().
 		Int32("sample_rate", targetSampleRate).
 		Str("voice", voiceID).
-		Msg("🎙️ TTS Stream başlatılıyor (v1.16.0)...")
+		Msg("🎙️ TTS Stream başlatılıyor...")
 
 	// 2. TTS Stream'i Başlat
 	ttsStream, err := m.Clients.TTS.SynthesizeStream(ctx, ttsReq)
@@ -76,7 +70,7 @@ func (m *Mediator) SpeakText(ctx context.Context, callID, text, voiceID string, 
 		return fmt.Errorf("media outbound stream hatası: %w", err)
 	}
 
-	// Handshake: CallID gönder (İlk mesaj sadece kimlik içerir)
+	// Handshake
 	if err := mediaStream.Send(&mediav1.StreamAudioToCallRequest{CallId: callID}); err != nil {
 		return fmt.Errorf("media handshake failed: %w", err)
 	}
@@ -86,7 +80,7 @@ func (m *Mediator) SpeakText(ctx context.Context, callID, text, voiceID string, 
 	for {
 		select {
 		case <-ctx.Done():
-			l.Warn().Msg("🛑 TTS stream context tarafından iptal edildi (Barge-in?).")
+			l.Warn().Msg("🛑 TTS stream context tarafından iptal edildi (Barge-in).")
 			return ctx.Err()
 		default:
 			chunk, err := ttsStream.Recv()
@@ -108,25 +102,9 @@ func (m *Mediator) SpeakText(ctx context.Context, callID, text, voiceID string, 
 
 Finish:
 	l.Debug().Int("chunks_sent", chunkCount).Msg("✅ TTS Stream başarıyla tamamlandı.")
-	// Stream'i kapat ve sunucudan son onayı (ACK) bekle
 	_ = mediaStream.CloseSend()
 	_, _ = mediaStream.Recv()
 	return nil
 }
 
-// TriggerHolePunching: NAT arkasındaki cihazlara erişim için delik açar.
-func (m *Mediator) TriggerHolePunching(ctx context.Context, mediaInfo *eventv1.MediaInfo) {
-	if mediaInfo.GetCallerRtpAddr() == "" {
-		return
-	}
-	// Bu işlem asenkron yapılır, sonucunu beklemeyiz.
-	req := &mediav1.PlayAudioRequest{
-		AudioUri:      "file://audio/tr/system/nat_warmer.wav",
-		ServerRtpPort: mediaInfo.GetServerRtpPort(),
-		RtpTargetAddr: mediaInfo.GetCallerRtpAddr(),
-	}
-	// Best-effort (Hata olsa da loglayıp geçeriz)
-	if _, err := m.Clients.Media.PlayAudio(ctx, req); err != nil {
-		m.log.Warn().Err(err).Msg("Hole punching isteği başarısız oldu (Kritik değil).")
-	}
-}
+// NOT: TriggerHolePunching metodu bilinçli olarak silinmiştir, artık Media Service otonom yönetir.
