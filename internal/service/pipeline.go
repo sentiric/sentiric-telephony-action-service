@@ -48,8 +48,8 @@ func (pm *PipelineManager) triggerFailsafe(ctx context.Context, callID string, r
 	if err != nil {
 		l.Error().Err(err).Str("event", "FAILSAFE_ERROR").Msg("🚨 Failsafe anonsu bile çalınamadı!")
 	} else {
-		// Anonsun okunması için sisteme süre tanıyoruz (Anons 6 saniye civarıdır)
-		time.Sleep(6 * time.Second)
+		// Anonsun okunması için sisteme süre tanıyoruz (Anons 7 saniye civarıdır)
+		time.Sleep(8 * time.Second)
 		l.Info().Str("event", "FAILSAFE_COMPLETED").Msg("✅ Arıza anonsu okundu. Çağrı artık güvenle sonlandırılabilir.")
 	}
 }
