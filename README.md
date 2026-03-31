@@ -1,4 +1,4 @@
-# 📞 Sentiric Telephony Action Service (v1.20.1)
+# 📞 Sentiric Telephony Action Service (v1.0.1)
 
 [![Status](https://img.shields.io/badge/status-production_ready-neon_green.svg)]()
 [![Architecture](https://img.shields.io/badge/arch-Async_Rust-orange.svg)]()
@@ -6,7 +6,7 @@
 
 **Sentiric Telephony Action Service (TAS)**, platformun **"Telekom İcracısı" (Execution Engine)** rolünü üstlenir. Agent servisinden veya doğrudan iş akışlarından (Workflow) gelen emirleri alır ve düşük seviyeli medya ile yapay zeka katmanlarını köprüler. 
 
-**v1.20.1 Mimarisi** ile birlikte bu servis tamamen Rust'a taşınmış olup, iş mantığı SDK'ya ( `sentiric-ai-pipeline-sdk` ) devredilmiş ve kilitlenmesiz (lock-free) bir köprü (bridge) haline getirilmiştir.
+**v1.0.1 Mimarisi** ile birlikte bu servis tamamen Rust'a taşınmış olup, iş mantığı SDK'ya ( `sentiric-ai-pipeline-sdk` ) devredilmiş ve kilitlenmesiz (lock-free) bir köprü (bridge) haline getirilmiştir.
 
 ---
 
