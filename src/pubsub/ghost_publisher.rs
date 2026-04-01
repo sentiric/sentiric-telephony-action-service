@@ -1,3 +1,4 @@
+// File: sentiric-telephony-action-service/src/pubsub/ghost_publisher.rs
 use chrono::Utc;
 use lapin::{options::*, BasicProperties, Connection, ConnectionProperties};
 use serde_json::json;
@@ -11,22 +12,27 @@ use tracing::{debug, error, info, warn};
 type RmqPayload = (String, Vec<u8>);
 type SharedGhostBuffer = Arc<Mutex<VecDeque<RmqPayload>>>;
 
+const MAX_BUFFER_CAPACITY: usize = 1000;
+const MAX_BACKOFF_SECS: u64 = 60; // Thundering herd koruması için max bekleme
+
 #[derive(Clone)]
 pub struct GhostPublisher {
     tx: mpsc::Sender<RmqPayload>,
-    tenant_id: String, // [ARCH-COMPLIANCE] Event payloadlarına eklenmek üzere saklanıyor
+    tenant_id: String,
 }
 
 impl GhostPublisher {
     pub fn new(amqp_url: String, tenant_id: String) -> Self {
         let (tx, mut rx) = mpsc::channel::<RmqPayload>(1000);
-        let buffer: SharedGhostBuffer = Arc::new(Mutex::new(VecDeque::with_capacity(1000)));
+        let buffer: SharedGhostBuffer =
+            Arc::new(Mutex::new(VecDeque::with_capacity(MAX_BUFFER_CAPACITY)));
 
+        // RX Task: Yeni olayları alır ve RAM'de tutar
         let buffer_clone = buffer.clone();
         tokio::spawn(async move {
             while let Some(msg) = rx.recv().await {
                 let mut guard = buffer_clone.lock().await;
-                if guard.len() >= 1000 {
+                if guard.len() >= MAX_BUFFER_CAPACITY {
                     guard.pop_front(); // FIFO Drop
                     warn!(event="GHOST_BUFFER_OVERFLOW", "RabbitMQ kapalı, buffer doldu. Eski olaylar RAM'den siliniyor (Graceful Degradation).");
                 }
@@ -34,16 +40,21 @@ impl GhostPublisher {
             }
         });
 
+        // TX Task: RabbitMQ bağlantısını dener ve buffer'ı eritir
         let worker_buffer = buffer.clone();
         tokio::spawn(async move {
+            let mut backoff = 1; // [ARCH-COMPLIANCE] Exponential Backoff Init
+
             loop {
                 match Connection::connect(&amqp_url, ConnectionProperties::default()).await {
                     Ok(conn) => {
+                        backoff = 1; // Bağlantı başarılı, backoff sıfırlanır
                         if let Ok(channel) = conn.create_channel().await {
                             info!(
                                 event = "RMQ_CONNECTED",
-                                "Ghost Publisher: RabbitMQ bağlantısı sağlandı."
+                                "Ghost Publisher: RabbitMQ bağlantısı sağlandı. RAM'deki olaylar eritiliyor..."
                             );
+
                             loop {
                                 let msg_opt = {
                                     let mut guard = worker_buffer.lock().await;
@@ -66,11 +77,15 @@ impl GhostPublisher {
                                             event = "RMQ_PUBLISH_FAIL",
                                             "Mesaj gönderilemedi, RAM'e iade ediliyor."
                                         );
-                                        worker_buffer
-                                            .lock()
-                                            .await
-                                            .push_front((routing_key, payload));
-                                        break; // Kopukluk var, dış döngüye dön
+
+                                        // [ARCH-COMPLIANCE] OOM Koruması: Geri koyarken kapasite aşımını önle
+                                        let mut guard = worker_buffer.lock().await;
+                                        if guard.len() >= MAX_BUFFER_CAPACITY {
+                                            warn!(event="GHOST_BUFFER_FULL_DISCARD", "Ring buffer tamamen dolu, başarısız olan en eski mesaj kalıcı olarak silindi.");
+                                        } else {
+                                            guard.push_front((routing_key, payload));
+                                        }
+                                        break; // Kopukluk var, dış döngüye (reconnect) dön
                                     } else {
                                         debug!(event="RMQ_PUBLISH_SUCCESS", routing_key=%routing_key, "Olay başarıyla RMQ'ya aktarıldı.");
                                     }
@@ -85,10 +100,13 @@ impl GhostPublisher {
                         }
                     }
                     Err(e) => {
-                        warn!(event="RMQ_CONNECT_FAIL", error=%e, "RabbitMQ ulaşılamaz durumda. Ghost Publisher devrede (Veriler RAM'de birikiyor).");
+                        warn!(event="RMQ_CONNECT_FAIL", error=%e, backoff_secs=backoff, "RabbitMQ ulaşılamaz durumda. Ghost Publisher devrede (Veriler RAM'de birikiyor).");
                     }
                 }
-                sleep(Duration::from_secs(5)).await;
+
+                // [ARCH-COMPLIANCE] Reconnection Storm'u Engelle (Exponential Backoff)
+                sleep(Duration::from_secs(backoff)).await;
+                backoff = std::cmp::min(backoff * 2, MAX_BACKOFF_SECS);
             }
         });
 
