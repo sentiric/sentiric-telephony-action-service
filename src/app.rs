@@ -1,10 +1,11 @@
+// File: sentiric-telephony-action-service/src/app.rs
 use crate::config::AppConfig;
 use crate::pubsub::ghost_publisher::GhostPublisher;
 use crate::server::{grpc, http};
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use std::sync::Arc;
 use tokio::signal;
-use tracing::info;
+use tracing::{error, info};
 
 pub async fn run(config: AppConfig) -> Result<()> {
     let cfg = Arc::new(config);
@@ -26,11 +27,18 @@ pub async fn run(config: AppConfig) -> Result<()> {
         _ = signal::ctrl_c() => {
             info!(event="SIGINT_RECEIVED", "Sistem zarif bir şekilde kapatılıyor (Graceful Shutdown)...");
         }
-        _ = http_server => {
-            info!(event="HTTP_SERVER_STOPPED", "HTTP Sunucusu durdu.");
+        res = http_server => {
+            // [ARCH-COMPLIANCE] Hata yutulması engellendi. Exit 1 ile çıkması sağlandı.
+            error!(event="HTTP_SERVER_STOPPED", result=?res, "HTTP Sunucusu beklenmedik şekilde durdu.");
+            return Err(anyhow!("HTTP Server stopped unexpectedly: {:?}", res));
         }
-        _ = grpc_server => {
-            info!(event="GRPC_SERVER_STOPPED", "gRPC Sunucusu durdu.");
+        res = grpc_server => {
+            // [ARCH-COMPLIANCE] gRPC task'ından dönen Result dışarıya paslandı.
+            error!(event="GRPC_SERVER_STOPPED", result=?res, "gRPC Sunucusu beklenmedik şekilde durdu.");
+            match res {
+                Ok(Err(e)) => return Err(anyhow!("gRPC Server failed: {}", e)),
+                _ => return Err(anyhow!("gRPC Server stopped unexpectedly")),
+            }
         }
     }
 

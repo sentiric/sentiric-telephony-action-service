@@ -1,3 +1,4 @@
+// File: sentiric-telephony-action-service/src/clients/media_client.rs
 use anyhow::{anyhow, Result};
 use sentiric_contracts::sentiric::media::v1::media_service_client::MediaServiceClient;
 use std::str::FromStr;
@@ -17,7 +18,7 @@ impl SecureMediaClient {
         key_path: &str,
         ca_path: &str,
     ) -> Result<Self> {
-        info!(event="MEDIA_CLIENT_CONNECT", target=%url, "media-service'e mTLS bağlantısı kuruluyor...");
+        info!(event="MEDIA_CLIENT_CONNECT", target=%url, "media-service'e mTLS bağlantısı kuruluyor (Lazy)...");
 
         if url.starts_with("http://") {
             return Err(anyhow!(
@@ -37,10 +38,11 @@ impl SecureMediaClient {
             .ca_certificate(ca)
             .identity(identity);
 
+        // [ARCH-COMPLIANCE] Senkron `.connect().await` yerine `.connect_lazy()` kullanıldı.
+        // Bu sayede hedef servis henüz ayakta değilse bile sistem çökmez, arkada reconnect dener.
         let channel = Endpoint::from_shared(url.to_string())?
             .tls_config(tls_config)?
-            .connect()
-            .await?;
+            .connect_lazy();
 
         Ok(Self {
             inner: MediaServiceClient::new(channel),
