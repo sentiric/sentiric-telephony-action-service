@@ -10,14 +10,15 @@ use crate::telemetry::SutsFormatter;
 use tracing::{error, info};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter, Registry};
 
-fn main() {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // DEĞİŞİKLİK 1
     dotenv::dotenv().ok();
 
     let config = match AppConfig::load() {
         Ok(cfg) => cfg,
         Err(e) => {
             eprintln!("[ARCH-COMPLIANCE] FATAL ERROR during config load: {}", e);
-            std::process::exit(1);
+            return Err(e.into()); // DEĞİŞİKLİK 2
         }
     };
 
@@ -59,7 +60,9 @@ fn main() {
     runtime.block_on(async {
         if let Err(e) = app::run(config).await {
             error!(event="SYSTEM_CRASH", error=%e, "Sistem kritik bir hata nedeniyle çöktü");
-            std::process::exit(1);
+            // std::process::exit(1) SİLİNDİ, BUNUN YERİNE:
         }
     });
+
+    Ok(()) // DEĞİŞİKLİK 3
 }
