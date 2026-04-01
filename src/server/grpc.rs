@@ -69,7 +69,7 @@ pub struct TelephonyService {
 }
 
 impl TelephonyService {
-    fn extract_meta(req: &Request<()>) -> (String, String, String) {
+    fn extract_meta<T>(req: &Request<T>) -> (String, String, String) {
         let tid = req
             .metadata()
             .get("x-trace-id")
@@ -100,7 +100,8 @@ impl TelephonyActionService for TelephonyService {
         &self,
         request: Request<RunPipelineRequest>,
     ) -> Result<Response<Self::RunPipelineStream>, Status> {
-        let (trace_id, span_id, tenant_id) = Self::extract_meta(&Request::new(()));
+        // [ARCH-COMPLIANCE FIX]: Request::new(()) silindi. Orijinal gRPC Request'inden context okunuyor.
+        let (trace_id, span_id, tenant_id) = Self::extract_meta(&request);
         let req = request.into_inner();
         let call_id = req.call_id.clone();
         let server_rtp_port = req
@@ -109,7 +110,7 @@ impl TelephonyActionService for TelephonyService {
             .map(|m| m.server_rtp_port)
             .unwrap_or(0);
 
-        info!(event="PIPELINE_INIT", trace_id=%trace_id, call_id=%call_id, "📞 Pipeline başlatılıyor.");
+        info!(event="PIPELINE_INIT", trace_id=%trace_id, span_id=%span_id, tenant_id=%tenant_id, call_id=%call_id, "📞 Pipeline başlatılıyor.");
 
         let (response_tx, response_rx) = mpsc::channel(10);
         let _ = response_tx
@@ -130,6 +131,7 @@ impl TelephonyActionService for TelephonyService {
             system_prompt_id: req.system_prompt_id.clone(),
             tts_voice_id: req.tts_model_id.clone(),
             tts_sample_rate: 8000,
+            edge_mode: false,
         };
 
         let orchestrator = PipelineOrchestrator::new(sdk_config)
@@ -164,7 +166,7 @@ impl TelephonyActionService for TelephonyService {
                 let mut record_stream = match m_client_inner.record_audio(record_req).await {
                     Ok(res) => res.into_inner(),
                     Err(e) => {
-                        error!(event="MEDIA_RX_FAIL", error=%e, "Media RX stream açılamadı.");
+                        error!(event="MEDIA_RX_FAIL", trace_id=%trace_id, span_id=%span_id, tenant_id=%tenant_id, error=%e, "Media RX stream açılamadı.");
                         publisher.publish_terminate_request(&cid_clone, &tid_clone, "MEDIA_RX_FAIL").await;
                         return;
                     }
@@ -203,7 +205,7 @@ impl TelephonyActionService for TelephonyService {
                 });
 
                 if let Err(e) = m_client_inner.stream_audio_to_call(stream_req).await {
-                    error!(event="MEDIA_TX_FAIL", error=%e, "Media TX stream açılamadı.");
+                    error!(event="MEDIA_TX_FAIL", trace_id=%trace_id, span_id=%span_id, tenant_id=%tenant_id, error=%e, "Media TX stream açılamadı.");
                 }
 
                 match orchestrator
@@ -219,11 +221,11 @@ impl TelephonyActionService for TelephonyService {
                     .await
                 {
                     Ok(_) => {
-                        info!(event="PIPELINE_COMPLETE", call_id=%cid_clone, "Pipeline doğal olarak tamamlandı.");
+                        info!(event="PIPELINE_COMPLETE", trace_id=%trace_id, span_id=%span_id, tenant_id=%tenant_id, call_id=%cid_clone, "Pipeline doğal olarak tamamlandı.");
                         publisher.publish_terminate_request(&cid_clone, &tid_clone, "PIPELINE_COMPLETE").await;
                     }
                     Err(e) => {
-                        error!(event="PIPELINE_ERROR", error=%e, "Pipeline hata verdi.");
+                        error!(event="PIPELINE_ERROR", trace_id=%trace_id, span_id=%span_id, tenant_id=%tenant_id, error=%e, "Pipeline hata verdi.");
                         publisher.publish_terminate_request(&cid_clone, &tid_clone, "PIPELINE_ERROR").await;
                     }
                 }
@@ -241,24 +243,23 @@ impl TelephonyActionService for TelephonyService {
         Ok(Response::new(ReceiverStream::new(response_rx)))
     }
 
-    // --- MOCK RPCs (Sözleşmeyi sağlamak için) ---
     async fn play_audio(
         &self,
         _r: Request<PlayAudioRequest>,
     ) -> Result<Response<PlayAudioResponse>, Status> {
-        Ok(Response::new(PlayAudioResponse { success: true })) // Clippy Düzeltildi
+        Ok(Response::new(PlayAudioResponse { success: true }))
     }
     async fn terminate_call(
         &self,
         _r: Request<TerminateCallRequest>,
     ) -> Result<Response<TerminateCallResponse>, Status> {
-        Ok(Response::new(TerminateCallResponse { success: true })) // Clippy Düzeltildi
+        Ok(Response::new(TerminateCallResponse { success: true }))
     }
     async fn send_text_message(
         &self,
         _r: Request<SendTextMessageRequest>,
     ) -> Result<Response<SendTextMessageResponse>, Status> {
-        Ok(Response::new(SendTextMessageResponse { success: true })) // Clippy Düzeltildi
+        Ok(Response::new(SendTextMessageResponse { success: true }))
     }
     async fn start_recording(
         &self,
