@@ -208,6 +208,8 @@ impl TelephonyActionService for TelephonyService {
                     error!(event="MEDIA_TX_FAIL", trace_id=%trace_id, span_id=%span_id, tenant_id=%tenant_id, error=%e, "Media TX stream açılamadı.");
                 }
 
+                let (_interrupt_tx, interrupt_rx) = mpsc::channel(10); // <--- [YENİ] Dummy Kanal
+
                 match orchestrator
                     .run_pipeline(
                         req.session_id.clone(),
@@ -217,6 +219,7 @@ impl TelephonyActionService for TelephonyService {
                         tenant_id.clone(),
                         sdk_rx_rx,
                         sdk_tx_tx,
+                        interrupt_rx, // <--- [EKLENDİ]
                     )
                     .await
                 {
