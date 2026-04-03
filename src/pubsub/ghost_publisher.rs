@@ -1,7 +1,7 @@
 // File: sentiric-telephony-action-service/src/pubsub/ghost_publisher.rs
-use chrono::Utc;
+// use chrono::Utc;
 use lapin::{options::*, BasicProperties, Connection, ConnectionProperties};
-use serde_json::json;
+// use serde_json::json;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
@@ -114,21 +114,35 @@ impl GhostPublisher {
     }
 
     pub async fn publish_terminate_request(&self, call_id: &str, trace_id: &str, reason: &str) {
-        let payload = json!({
-            "eventType": "call.terminate.request",
-            "traceId": trace_id,
-            "tenantId": self.tenant_id,
-            "timestamp": Utc::now().to_rfc3339(),
-            "payloadJson": json!({
-                "callId": call_id,
-                "reason": reason
-            }).to_string()
-        });
+        use chrono::Utc;
+        use prost::Message;
+        use sentiric_contracts::sentiric::event::v1::GenericEvent;
+        use serde_json::json;
 
-        let data = serde_json::to_vec(&payload).unwrap_or_default();
-        let _ = self
-            .tx
-            .send(("call.terminate.request".to_string(), data))
-            .await;
+        // Anayasa gereği payload'un kendisi stringified JSON, zarf ise Protobuf GenericEvent olmalıdır
+        let payload_json = json!({
+            "callId": call_id,
+            "reason": reason
+        })
+        .to_string();
+
+        let event = GenericEvent {
+            event_type: "call.terminate.request".to_string(),
+            trace_id: trace_id.to_string(),
+            timestamp: Some(prost_types::Timestamp {
+                seconds: Utc::now().timestamp(),
+                nanos: Utc::now().timestamp_subsec_nanos() as i32,
+            }),
+            tenant_id: self.tenant_id.clone(),
+            payload_json,
+        };
+
+        let mut data = Vec::new();
+        if event.encode(&mut data).is_ok() {
+            let _ = self
+                .tx
+                .send(("call.terminate.request".to_string(), data))
+                .await;
+        }
     }
 }
