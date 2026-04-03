@@ -215,7 +215,13 @@ impl TelephonyActionService for TelephonyService {
 
                 tokio::spawn(async move {
                     if let Err(e) = m_client_rpc.stream_audio_to_call(stream_req).await {
-                        tracing::error!(event="MEDIA_TX_FAIL", trace_id=%t_id_rpc, span_id=%s_id_rpc, tenant_id=%ten_id_rpc, error=%e, "Media TX stream açılamadı.");
+                        let err_msg = e.message().to_string();
+                        if err_msg.contains("Stream empty") {
+                            // [ARCH-COMPLIANCE] AI bir şey söylemeden kapattıysa bu hata değildir.
+                            tracing::debug!(event="MEDIA_TX_EMPTY", trace_id=%t_id_rpc, span_id=%s_id_rpc, tenant_id=%ten_id_rpc, "AI did not generate any audio before closing stream. This is expected.");
+                        } else {
+                            tracing::error!(event="MEDIA_TX_FAIL", trace_id=%t_id_rpc, span_id=%s_id_rpc, tenant_id=%ten_id_rpc, error=%e, "Media TX stream açılamadı.");
+                        }
                     }
                 });
 
