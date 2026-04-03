@@ -1,3 +1,4 @@
+// Dosya: src/server/grpc.rs
 use crate::clients::media_client::SecureMediaClient;
 use crate::config::AppConfig;
 use crate::pubsub::ghost_publisher::GhostPublisher;
@@ -193,7 +194,6 @@ impl TelephonyActionService for TelephonyService {
                 let c_id = cid_clone.clone();
                 tokio::spawn(async move {
                     while let Some(event) = sdk_tx_rx.recv().await {
-                        // Sadece ses eventlerini ayıklar ve PBX'e yollar
                         if let PipelineEvent::Audio(chunk) = event {
                             let msg = StreamAudioToCallRequest {
                                 call_id: c_id.clone(),
@@ -206,9 +206,18 @@ impl TelephonyActionService for TelephonyService {
                     }
                 });
 
-                if let Err(e) = m_client_inner.stream_audio_to_call(stream_req).await {
-                    error!(event="MEDIA_TX_FAIL", trace_id=%trace_id, span_id=%span_id, tenant_id=%tenant_id, error=%e, "Media TX stream açılamadı.");
-                }
+                // [CRITICAL FIX]: mut m_client_rpc kullanılarak E0596 çözüldü.
+                // Media Service'e (Tx) asenkron bağlan, bekleme! (Deadlock Koruması)
+                let mut m_client_rpc = m_client_inner.clone();
+                let t_id_rpc = trace_id.clone();
+                let s_id_rpc = span_id.clone();
+                let ten_id_rpc = tenant_id.clone();
+
+                tokio::spawn(async move {
+                    if let Err(e) = m_client_rpc.stream_audio_to_call(stream_req).await {
+                        tracing::error!(event="MEDIA_TX_FAIL", trace_id=%t_id_rpc, span_id=%s_id_rpc, tenant_id=%ten_id_rpc, error=%e, "Media TX stream açılamadı.");
+                    }
+                });
 
                 let (_interrupt_tx, interrupt_rx) = mpsc::channel(10);
 
