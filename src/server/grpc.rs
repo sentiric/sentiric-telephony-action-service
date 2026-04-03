@@ -3,7 +3,7 @@ use crate::config::AppConfig;
 use crate::pubsub::ghost_publisher::GhostPublisher;
 use anyhow::Result;
 use futures::StreamExt;
-use sentiric_ai_pipeline_sdk::{PipelineOrchestrator, SdkConfig};
+use sentiric_ai_pipeline_sdk::{PipelineEvent, PipelineOrchestrator, SdkConfig};
 use sentiric_contracts::sentiric::media::v1::{RecordAudioRequest, StreamAudioToCallRequest};
 use sentiric_contracts::sentiric::telephony::v1::telephony_action_service_server::{
     TelephonyActionService, TelephonyActionServiceServer,
@@ -100,7 +100,6 @@ impl TelephonyActionService for TelephonyService {
         &self,
         request: Request<RunPipelineRequest>,
     ) -> Result<Response<Self::RunPipelineStream>, Status> {
-        // [ARCH-COMPLIANCE FIX]: Request::new(()) silindi. Orijinal gRPC Request'inden context okunuyor.
         let (trace_id, span_id, tenant_id) = Self::extract_meta(&request);
         let req = request.into_inner();
         let call_id = req.call_id.clone();
@@ -193,13 +192,16 @@ impl TelephonyActionService for TelephonyService {
 
                 let c_id = cid_clone.clone();
                 tokio::spawn(async move {
-                    while let Some(chunk) = sdk_tx_rx.recv().await {
-                        let msg = StreamAudioToCallRequest {
-                            call_id: c_id.clone(),
-                            audio_chunk: chunk,
-                        };
-                        if media_tx_tx.send(msg).await.is_err() {
-                            break;
+                    while let Some(event) = sdk_tx_rx.recv().await {
+                        // Sadece ses eventlerini ayıklar ve PBX'e yollar
+                        if let PipelineEvent::Audio(chunk) = event {
+                            let msg = StreamAudioToCallRequest {
+                                call_id: c_id.clone(),
+                                audio_chunk: chunk,
+                            };
+                            if media_tx_tx.send(msg).await.is_err() {
+                                break;
+                            }
                         }
                     }
                 });
@@ -208,7 +210,7 @@ impl TelephonyActionService for TelephonyService {
                     error!(event="MEDIA_TX_FAIL", trace_id=%trace_id, span_id=%span_id, tenant_id=%tenant_id, error=%e, "Media TX stream açılamadı.");
                 }
 
-                let (_interrupt_tx, interrupt_rx) = mpsc::channel(10); // <--- [YENİ] Dummy Kanal
+                let (_interrupt_tx, interrupt_rx) = mpsc::channel(10);
 
                 match orchestrator
                     .run_pipeline(
@@ -219,7 +221,7 @@ impl TelephonyActionService for TelephonyService {
                         tenant_id.clone(),
                         sdk_rx_rx,
                         sdk_tx_tx,
-                        interrupt_rx, // <--- [EKLENDİ]
+                        interrupt_rx,
                     )
                     .await
                 {
