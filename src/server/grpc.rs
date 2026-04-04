@@ -130,7 +130,10 @@ impl TelephonyActionService for TelephonyService {
             language_code: req.language_code.clone(),
             system_prompt_id: req.system_prompt_id.clone(),
             tts_voice_id: req.tts_model_id.clone(),
-            tts_sample_rate: 8000,
+            // [ARCH-COMPLIANCE FIX]: SIP standartlarına uygun 16kHz/8kHz eşlemesi.
+            // .env içindeki PIPELINE_SAMPLE_RATE değerini okuyacak şekilde yapılandırılabilir,
+            // şimdilik Whisper standardı olan 16000'e sabitliyoruz.
+            tts_sample_rate: 16000,
             edge_mode: false,
         };
 
