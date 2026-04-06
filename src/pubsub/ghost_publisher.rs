@@ -16,6 +16,7 @@ const MAX_BUFFER_CAPACITY: usize = 1000;
 const MAX_BACKOFF_SECS: u64 = 60; // Thundering herd koruması için max bekleme
 
 #[derive(Clone)]
+#[allow(dead_code)] // [ARCH-COMPLIANCE FIX]
 pub struct GhostPublisher {
     tx: mpsc::Sender<RmqPayload>,
     tenant_id: String,
@@ -113,6 +114,7 @@ impl GhostPublisher {
         Self { tx, tenant_id }
     }
 
+    #[allow(dead_code)] // [ARCH-COMPLIANCE FIX]
     pub async fn publish_terminate_request(&self, call_id: &str, trace_id: &str, reason: &str) {
         use chrono::Utc;
         use prost::Message;

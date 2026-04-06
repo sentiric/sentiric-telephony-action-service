@@ -65,6 +65,7 @@ pub async fn start_server(
 
 pub struct TelephonyService {
     config: Arc<AppConfig>,
+    #[allow(dead_code)] // [ARCH-COMPLIANCE FIX]
     publisher: GhostPublisher,
     media_client: SecureMediaClient,
 }
@@ -149,9 +150,11 @@ impl TelephonyActionService for TelephonyService {
             .map_err(|e| Status::internal(e.to_string()))?;
 
         let m_client = self.media_client.clone();
-        let publisher = self.publisher.clone();
+
+        // [ARCH-COMPLIANCE FIX]: Kullanılmayan publisher ve tid_clone değişkenleri temizlendi.
+        // let publisher = self.publisher.clone();
         let cid_clone = call_id.clone();
-        let tid_clone = trace_id.clone();
+        // let tid_clone = trace_id.clone();
 
         tokio::spawn(
             async move {
