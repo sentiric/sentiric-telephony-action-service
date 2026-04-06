@@ -1,4 +1,4 @@
-// Dosya: src/server/grpc.rs
+// File: sentiric-telephony-action-service/src/server/grpc.rs
 use crate::clients::media_client::SecureMediaClient;
 use crate::config::AppConfig;
 use crate::pubsub::ghost_publisher::GhostPublisher;
@@ -91,6 +91,15 @@ impl TelephonyService {
             .to_string();
         (tid, sid, ten)
     }
+
+    // [YENİ]: Basit RMS tabanlı Sessizlik Dedektörü (VAD)
+    fn calculate_rms(samples: &[i16]) -> f32 {
+        if samples.is_empty() {
+            return 0.0;
+        }
+        let sum: f64 = samples.iter().map(|&s| (s as f64) * (s as f64)).sum();
+        (sum / samples.len() as f64).sqrt() as f32
+    }
 }
 
 #[tonic::async_trait]
@@ -110,7 +119,7 @@ impl TelephonyActionService for TelephonyService {
             .map(|m| m.server_rtp_port)
             .unwrap_or(0);
 
-        info!(event="PIPELINE_INIT", trace_id=%trace_id, span_id=%span_id, tenant_id=%tenant_id, call_id=%call_id, "📞 Pipeline başlatılıyor.");
+        info!(event="PIPELINE_INIT", trace_id=%trace_id, call_id=%call_id, "📞 Telekom Pipeline başlatılıyor.");
 
         let (response_tx, response_rx) = mpsc::channel(10);
         let _ = response_tx
@@ -130,11 +139,9 @@ impl TelephonyActionService for TelephonyService {
             language_code: req.language_code.clone(),
             system_prompt_id: req.system_prompt_id.clone(),
             tts_voice_id: req.tts_model_id.clone(),
-            // [ARCH-COMPLIANCE FIX]: SIP standartlarına uygun 16kHz/8kHz eşlemesi.
-            // .env içindeki PIPELINE_SAMPLE_RATE değerini okuyacak şekilde yapılandırılabilir,
-            // şimdilik Whisper standardı olan 16000'e sabitliyoruz.
             tts_sample_rate: 16000,
-            edge_mode: false,
+            edge_mode: req.edge_mode,
+            listen_only_mode: false, // Telefon aramaları her zaman interaktiftir
         };
 
         let orchestrator = PipelineOrchestrator::new(sdk_config)
@@ -169,15 +176,38 @@ impl TelephonyActionService for TelephonyService {
                 let mut record_stream = match m_client_inner.record_audio(record_req).await {
                     Ok(res) => res.into_inner(),
                     Err(e) => {
-                        error!(event="MEDIA_RX_FAIL", trace_id=%trace_id, span_id=%span_id, tenant_id=%tenant_id, error=%e, "Media RX stream açılamadı.");
-                        publisher.publish_terminate_request(&cid_clone, &tid_clone, "MEDIA_RX_FAIL").await;
+                        error!(event="MEDIA_RX_FAIL", error=%e, "Media RX stream açılamadı.");
                         return;
                     }
                 };
 
                 let (sdk_rx_tx, sdk_rx_rx) = mpsc::channel(100);
+
+                // [SERVER-SIDE VAD]: RTP Akışını Dinle ve Sessizlikte EOS fırlat
                 tokio::spawn(async move {
+                    let mut last_speech_time = std::time::Instant::now();
+                    let mut is_speaking = false;
+                    let silence_threshold = 200.0; // RMS Eşiği (Arka plan gürültüsüne göre ayarlanabilir)
+                    let silence_timeout = std::time::Duration::from_millis(1500);
+
                     while let Some(Ok(res)) = record_stream.next().await {
+                        let samples: Vec<i16> = res
+                            .audio_data
+                            .chunks_exact(2)
+                            .map(|c| i16::from_le_bytes([c[0], c[1]]))
+                            .collect();
+
+                        let rms = TelephonyService::calculate_rms(&samples);
+
+                        if rms > silence_threshold {
+                            last_speech_time = std::time::Instant::now();
+                            is_speaking = true;
+                        } else if is_speaking && last_speech_time.elapsed() > silence_timeout {
+                            is_speaking = false;
+                            // [KRİTİK]: Whisper'a EOS (Sessizlik Bitişi) sinyali gönder!
+                            let _ = sdk_rx_tx.send(vec![]).await;
+                        }
+
                         if sdk_rx_tx.send(res.audio_data).await.is_err() {
                             break;
                         }
@@ -209,28 +239,13 @@ impl TelephonyActionService for TelephonyService {
                     }
                 });
 
-                // [CRITICAL FIX]: mut m_client_rpc kullanılarak E0596 çözüldü.
-                // Media Service'e (Tx) asenkron bağlan, bekleme! (Deadlock Koruması)
                 let mut m_client_rpc = m_client_inner.clone();
-                let t_id_rpc = trace_id.clone();
-                let s_id_rpc = span_id.clone();
-                let ten_id_rpc = tenant_id.clone();
-
                 tokio::spawn(async move {
-                    if let Err(e) = m_client_rpc.stream_audio_to_call(stream_req).await {
-                        let err_msg = e.message().to_string();
-                        if err_msg.contains("Stream empty") {
-                            // [ARCH-COMPLIANCE] AI bir şey söylemeden kapattıysa bu hata değildir.
-                            tracing::debug!(event="MEDIA_TX_EMPTY", trace_id=%t_id_rpc, span_id=%s_id_rpc, tenant_id=%ten_id_rpc, "AI did not generate any audio before closing stream. This is expected.");
-                        } else {
-                            tracing::error!(event="MEDIA_TX_FAIL", trace_id=%t_id_rpc, span_id=%s_id_rpc, tenant_id=%ten_id_rpc, error=%e, "Media TX stream açılamadı.");
-                        }
-                    }
+                    let _ = m_client_rpc.stream_audio_to_call(stream_req).await;
                 });
 
                 let (_interrupt_tx, interrupt_rx) = mpsc::channel(10);
-
-                match orchestrator
+                let _ = orchestrator
                     .run_pipeline(
                         req.session_id.clone(),
                         "system".into(),
@@ -241,17 +256,7 @@ impl TelephonyActionService for TelephonyService {
                         sdk_tx_tx,
                         interrupt_rx,
                     )
-                    .await
-                {
-                    Ok(_) => {
-                        info!(event="PIPELINE_COMPLETE", trace_id=%trace_id, span_id=%span_id, tenant_id=%tenant_id, call_id=%cid_clone, "Pipeline doğal olarak tamamlandı.");
-                        publisher.publish_terminate_request(&cid_clone, &tid_clone, "PIPELINE_COMPLETE").await;
-                    }
-                    Err(e) => {
-                        error!(event="PIPELINE_ERROR", trace_id=%trace_id, span_id=%span_id, tenant_id=%tenant_id, error=%e, "Pipeline hata verdi.");
-                        publisher.publish_terminate_request(&cid_clone, &tid_clone, "PIPELINE_ERROR").await;
-                    }
-                }
+                    .await;
 
                 let _ = response_tx
                     .send(Ok(RunPipelineResponse {
@@ -266,6 +271,7 @@ impl TelephonyActionService for TelephonyService {
         Ok(Response::new(ReceiverStream::new(response_rx)))
     }
 
+    // Diğer metodlar aynı kalıyor (play_audio, terminate_call vb.)
     async fn play_audio(
         &self,
         _r: Request<PlayAudioRequest>,
