@@ -65,7 +65,7 @@ pub async fn start_server(
 
 pub struct TelephonyService {
     config: Arc<AppConfig>,
-    #[allow(dead_code)] // [ARCH-COMPLIANCE FIX]
+    #[allow(dead_code)]
     publisher: GhostPublisher,
     media_client: SecureMediaClient,
 }
@@ -93,7 +93,6 @@ impl TelephonyService {
         (tid, sid, ten)
     }
 
-    // [YENİ]: Basit RMS tabanlı Sessizlik Dedektörü (VAD)
     fn calculate_rms(samples: &[i16]) -> f32 {
         if samples.is_empty() {
             return 0.0;
@@ -142,7 +141,7 @@ impl TelephonyActionService for TelephonyService {
             tts_voice_id: req.tts_model_id.clone(),
             tts_sample_rate: 16000,
             edge_mode: req.edge_mode,
-            listen_only_mode: false, // Telefon aramaları her zaman interaktiftir
+            listen_only_mode: false,
         };
 
         let orchestrator = PipelineOrchestrator::new(sdk_config)
@@ -150,11 +149,7 @@ impl TelephonyActionService for TelephonyService {
             .map_err(|e| Status::internal(e.to_string()))?;
 
         let m_client = self.media_client.clone();
-
-        // [ARCH-COMPLIANCE FIX]: Kullanılmayan publisher ve tid_clone değişkenleri temizlendi.
-        // let publisher = self.publisher.clone();
         let cid_clone = call_id.clone();
-        // let tid_clone = trace_id.clone();
 
         tokio::spawn(
             async move {
@@ -186,11 +181,12 @@ impl TelephonyActionService for TelephonyService {
 
                 let (sdk_rx_tx, sdk_rx_rx) = mpsc::channel(100);
 
-                // [SERVER-SIDE VAD]: RTP Akışını Dinle ve Sessizlikte EOS fırlat
+                // [MİMARİ DÜZELTME]: VAD Gate. Sessizlikte veri aktarımını tamamen durdurarak Whisper'ı korur.
                 tokio::spawn(async move {
                     let mut last_speech_time = std::time::Instant::now();
                     let mut is_speaking = false;
-                    let silence_threshold = 200.0; // RMS Eşiği (Arka plan gürültüsüne göre ayarlanabilir)
+                    let mut sent_eos = false;
+                    let silence_threshold = 200.0;
                     let silence_timeout = std::time::Duration::from_millis(1500);
 
                     while let Some(Ok(res)) = record_stream.next().await {
@@ -205,14 +201,21 @@ impl TelephonyActionService for TelephonyService {
                         if rms > silence_threshold {
                             last_speech_time = std::time::Instant::now();
                             is_speaking = true;
+                            sent_eos = false;
                         } else if is_speaking && last_speech_time.elapsed() > silence_timeout {
                             is_speaking = false;
-                            // [KRİTİK]: Whisper'a EOS (Sessizlik Bitişi) sinyali gönder!
-                            let _ = sdk_rx_tx.send(vec![]).await;
                         }
 
-                        if sdk_rx_tx.send(res.audio_data).await.is_err() {
-                            break;
+                        if is_speaking || last_speech_time.elapsed() <= silence_timeout {
+                            // Konuşma var veya padding süresi içindeyiz
+                            if sdk_rx_tx.send(res.audio_data).await.is_err() {
+                                break;
+                            }
+                        } else if !sent_eos {
+                            // Kesin sessizlik. Sadece BİR KEZ EOS fırlat.
+                            let _ = sdk_rx_tx.send(vec![]).await;
+                            sent_eos = true;
+                            // Bundan sonraki sessiz RTP paketleri DROP edilir (Whisper'a yük olmaz).
                         }
                     }
                 });
@@ -274,7 +277,6 @@ impl TelephonyActionService for TelephonyService {
         Ok(Response::new(ReceiverStream::new(response_rx)))
     }
 
-    // Diğer metodlar aynı kalıyor (play_audio, terminate_call vb.)
     async fn play_audio(
         &self,
         _r: Request<PlayAudioRequest>,
