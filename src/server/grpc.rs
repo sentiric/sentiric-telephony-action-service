@@ -142,6 +142,8 @@ impl TelephonyActionService for TelephonyService {
             tts_sample_rate: 16000,
             edge_mode: req.edge_mode,
             listen_only_mode: false,
+            // [ARCH-COMPLIANCE FIX]: Yeni özellik Telephony Action'da pasif olacak (SIP için gereksiz).
+            speak_only_mode: false,
         };
 
         let orchestrator = PipelineOrchestrator::new(sdk_config)
@@ -179,9 +181,10 @@ impl TelephonyActionService for TelephonyService {
                     }
                 };
 
-                let (sdk_rx_tx, sdk_rx_rx) = mpsc::channel(100);
+                // [ARCH-COMPLIANCE FIX]: Kanal tipi PipelineInputEvent yapıldı
+                let (sdk_rx_tx, sdk_rx_rx) =
+                    mpsc::channel::<sentiric_ai_pipeline_sdk::PipelineInputEvent>(100);
 
-                // [MİMARİ DÜZELTME]: VAD Gate. Sessizlikte veri aktarımını tamamen durdurarak Whisper'ı korur.
                 tokio::spawn(async move {
                     let mut last_speech_time = std::time::Instant::now();
                     let mut is_speaking = false;
@@ -207,15 +210,21 @@ impl TelephonyActionService for TelephonyService {
                         }
 
                         if is_speaking || last_speech_time.elapsed() <= silence_timeout {
-                            // Konuşma var veya padding süresi içindeyiz
-                            if sdk_rx_tx.send(res.audio_data).await.is_err() {
+                            // [MİMARİ KORUMA]: Normal SIP sesleri Audio(chunk) olarak sarılır.
+                            if sdk_rx_tx
+                                .send(sentiric_ai_pipeline_sdk::PipelineInputEvent::Audio(
+                                    res.audio_data,
+                                ))
+                                .await
+                                .is_err()
+                            {
                                 break;
                             }
                         } else if !sent_eos {
-                            // Kesin sessizlik. Sadece BİR KEZ EOS fırlat.
-                            let _ = sdk_rx_tx.send(vec![]).await;
+                            let _ = sdk_rx_tx
+                                .send(sentiric_ai_pipeline_sdk::PipelineInputEvent::Audio(vec![]))
+                                .await;
                             sent_eos = true;
-                            // Bundan sonraki sessiz RTP paketleri DROP edilir (Whisper'a yük olmaz).
                         }
                     }
                 });
