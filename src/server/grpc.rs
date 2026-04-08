@@ -142,8 +142,8 @@ impl TelephonyActionService for TelephonyService {
             tts_sample_rate: 16000,
             edge_mode: req.edge_mode,
             listen_only_mode: false,
-            // [ARCH-COMPLIANCE FIX]: Yeni özellik Telephony Action'da pasif olacak (SIP için gereksiz).
             speak_only_mode: false,
+            chat_only_mode: false,
         };
 
         let orchestrator = PipelineOrchestrator::new(sdk_config)
@@ -152,6 +152,7 @@ impl TelephonyActionService for TelephonyService {
 
         let m_client = self.media_client.clone();
         let cid_clone = call_id.clone();
+        let publisher_clone = self.publisher.clone();
 
         tokio::spawn(
             async move {
@@ -181,7 +182,6 @@ impl TelephonyActionService for TelephonyService {
                     }
                 };
 
-                // [ARCH-COMPLIANCE FIX]: Kanal tipi PipelineInputEvent yapıldı
                 let (sdk_rx_tx, sdk_rx_rx) =
                     mpsc::channel::<sentiric_ai_pipeline_sdk::PipelineInputEvent>(100);
 
@@ -210,7 +210,6 @@ impl TelephonyActionService for TelephonyService {
                         }
 
                         if is_speaking || last_speech_time.elapsed() <= silence_timeout {
-                            // [MİMARİ KORUMA]: Normal SIP sesleri Audio(chunk) olarak sarılır.
                             if sdk_rx_tx
                                 .send(sentiric_ai_pipeline_sdk::PipelineInputEvent::Audio(
                                     res.audio_data,
@@ -239,17 +238,52 @@ impl TelephonyActionService for TelephonyService {
                     &tenant_id,
                 );
 
+                let loop_trace_id = trace_id.clone();
+                let loop_tenant_id = tenant_id.clone();
                 let c_id = cid_clone.clone();
+                let inner_publisher = publisher_clone.clone();
+
                 tokio::spawn(async move {
                     while let Some(event) = sdk_tx_rx.recv().await {
-                        if let PipelineEvent::Audio(chunk) = event {
-                            let msg = StreamAudioToCallRequest {
-                                call_id: c_id.clone(),
-                                audio_chunk: chunk,
-                            };
-                            if media_tx_tx.send(msg).await.is_err() {
-                                break;
+                        match event {
+                            PipelineEvent::Audio(chunk) => {
+                                let msg = StreamAudioToCallRequest {
+                                    call_id: c_id.clone(),
+                                    audio_chunk: chunk,
+                                };
+                                if media_tx_tx.send(msg).await.is_err() {
+                                    break;
+                                }
                             }
+                            PipelineEvent::AcousticMoodShifted { previous_mood, current_mood, arousal_shift, valence_shift, speaker_id } => {
+                                let payload = serde_json::json!({
+                                    "trace_id": loop_trace_id,
+                                    "call_id": c_id,
+                                    "previous_mood": previous_mood,
+                                    "current_mood": current_mood,
+                                    "arousal_shift": arousal_shift,
+                                    "valence_shift": valence_shift,
+                                    "speaker_id": speaker_id
+                                });
+                                use sentiric_contracts::sentiric::event::v1::GenericEvent;
+                                use prost::Message;
+                                let event_msg = GenericEvent {
+                                    event_type: "acoustic.mood.shifted".to_string(),
+                                    trace_id: loop_trace_id.clone(),
+                                    timestamp: Some(prost_types::Timestamp {
+                                        seconds: chrono::Utc::now().timestamp(),
+                                        nanos: chrono::Utc::now().timestamp_subsec_nanos() as i32,
+                                    }),
+                                    tenant_id: loop_tenant_id.clone(),
+                                    payload_json: payload.to_string(),
+                                };
+                                let mut buf = Vec::new();
+                                if event_msg.encode(&mut buf).is_ok() {
+                                    inner_publisher.publish_raw("acoustic.mood.shifted", buf).await;
+                                    tracing::info!(event="MOOD_SHIFT_PROPAGATED", trace_id=%loop_trace_id, "Acoustic anomaly detected and published to RMQ.");
+                                }
+                            }
+                            _ => {}
                         }
                     }
                 });

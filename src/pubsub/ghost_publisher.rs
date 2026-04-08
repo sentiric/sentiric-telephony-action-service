@@ -147,4 +147,9 @@ impl GhostPublisher {
                 .await;
         }
     }
+
+    #[allow(dead_code)]
+    pub async fn publish_raw(&self, routing_key: &str, payload: Vec<u8>) {
+        let _ = self.tx.send((routing_key.to_string(), payload)).await;
+    }
 }
