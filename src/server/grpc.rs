@@ -255,9 +255,11 @@ impl TelephonyActionService for TelephonyService {
                                     break;
                                 }
                             }
-                            PipelineEvent::AcousticMoodShifted { previous_mood, current_mood, arousal_shift, valence_shift, speaker_id } => {
+                            // [ARCH-COMPLIANCE FIX]: SDK v0.1.16 session_id eklendi
+                            PipelineEvent::AcousticMoodShifted { session_id: evt_sess_id, previous_mood, current_mood, arousal_shift, valence_shift, speaker_id } => {
                                 let payload = serde_json::json!({
                                     "trace_id": loop_trace_id,
+                                    "session_id": evt_sess_id, // Crystalline için eklendi
                                     "call_id": c_id,
                                     "previous_mood": previous_mood,
                                     "current_mood": current_mood,
