@@ -24,7 +24,7 @@ use tonic::{
     transport::{Certificate, Identity, Server, ServerTlsConfig},
     Request, Response, Status,
 };
-use tracing::{error, info, Instrument};
+use tracing::{debug, error, info, Instrument};
 
 pub async fn start_server(
     addr: std::net::SocketAddr,
@@ -199,7 +199,7 @@ impl TelephonyActionService for TelephonyService {
                     let mut is_speaking = false;
                     let mut sent_eos = false;
                     let base_silence_threshold = 200.0;
-                    
+
                     // [HIZLANDIRMA UYGULANDI]: 1500ms'den 800ms'ye çekildi. Çok daha akıcı ve hızlı yanıt verecek.
                     let silence_timeout = std::time::Duration::from_millis(800);
 
@@ -214,15 +214,20 @@ impl TelephonyActionService for TelephonyService {
 
                         let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
                         let last_ai_ms = ai_speaking_time_rx.load(Ordering::Relaxed);
-                        
+
                         let mut current_threshold = base_silence_threshold;
+
                         // AI konuşurken mikrofon 2.5x sağırlaşır (Echo Guard)
                         if now_ms.saturating_sub(last_ai_ms) < 1000 {
-                            current_threshold = base_silence_threshold * 2.5; 
+                            current_threshold = base_silence_threshold * 2.5;
                         }
 
                         if rms > current_threshold {
+                            // [ARCH-COMPLIANCE] SUTS v4.2: Sürekli basılan VAD değerleri DEBUG'a çekildi.
+                            debug!(event="VAD_SPEECH_DETECTED", rms=%rms, threshold=%current_threshold, "Ses algılandı.");
+
                             last_speech_time = std::time::Instant::now();
+
                             is_speaking = true;
                             sent_eos = false;
                         } else if is_speaking && last_speech_time.elapsed() > silence_timeout {
@@ -258,7 +263,7 @@ impl TelephonyActionService for TelephonyService {
                 );
 
                 let loop_trace_id = trace_id.clone();
-                let loop_tenant_id = tenant_id.clone();
+                let _loop_tenant_id = tenant_id.clone();
                 let c_id = cid_clone.clone();
                 let inner_publisher = publisher_clone.clone();
 
@@ -282,7 +287,6 @@ impl TelephonyActionService for TelephonyService {
                                     PipelineEvent::AcousticMoodShifted { session_id: _evt_sess_id, previous_mood, current_mood, arousal_shift, valence_shift, speaker_id } => {
                                         use sentiric_contracts::sentiric::event::v1::AcousticMoodShiftedEvent;
                                         use prost::Message;
-                                        
                                         let event_msg = AcousticMoodShiftedEvent {
                                             event_type: "acoustic.mood.shifted".to_string(),
                                             trace_id: loop_trace_id.clone(),
@@ -305,15 +309,15 @@ impl TelephonyActionService for TelephonyService {
                                     _ => {}
                                 }
                             }
-                            Ok(None) => break, 
+                            Ok(None) => break,
                             Err(_) => {
                                 // Keep-Alive Ping
                                 let msg = StreamAudioToCallRequest {
                                     call_id: c_id.clone(),
-                                    audio_chunk: vec![], 
+                                    audio_chunk: vec![],
                                 };
                                 if media_tx_tx.send(msg).await.is_err() {
-                                    break; 
+                                    break;
                                 }
                             }
                         }
