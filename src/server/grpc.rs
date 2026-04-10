@@ -15,7 +15,9 @@ use sentiric_contracts::sentiric::telephony::v1::{
     SpeakTextResponse, StartRecordingRequest, StartRecordingResponse, StopRecordingRequest,
     StopRecordingResponse, TerminateCallRequest, TerminateCallResponse,
 };
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{
@@ -185,11 +187,19 @@ impl TelephonyActionService for TelephonyService {
                 let (sdk_rx_tx, sdk_rx_rx) =
                     mpsc::channel::<sentiric_ai_pipeline_sdk::PipelineInputEvent>(100);
 
+                // [EKLENDİ]: Echo Guard (Dynamic VAD) için State Paylaşımı
+                let ai_speaking_time = Arc::new(AtomicU64::new(0));
+                let ai_speaking_time_rx = ai_speaking_time.clone();
+                let ai_speaking_time_tx = ai_speaking_time.clone();
+
+                // ----------------------------------------------------
+                // 1. RX TASK (Media -> STT)
+                // ----------------------------------------------------
                 tokio::spawn(async move {
                     let mut last_speech_time = std::time::Instant::now();
                     let mut is_speaking = false;
                     let mut sent_eos = false;
-                    let silence_threshold = 200.0;
+                    let base_silence_threshold = 200.0;
                     let silence_timeout = std::time::Duration::from_millis(1500);
 
                     while let Some(Ok(res)) = record_stream.next().await {
@@ -201,7 +211,17 @@ impl TelephonyActionService for TelephonyService {
 
                         let rms = TelephonyService::calculate_rms(&samples);
 
-                        if rms > silence_threshold {
+                        // [EKLENDİ]: Dynamic VAD Mantığı (Echo Koruması)
+                        let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+                        let last_ai_ms = ai_speaking_time_rx.load(Ordering::Relaxed);
+                        
+                        let mut current_threshold = base_silence_threshold;
+                        // AI son 1 saniye içinde konuştuysa, mikrofon eşiğini 2.5 katına çıkar (Sağırlaştır)
+                        if now_ms.saturating_sub(last_ai_ms) < 1000 {
+                            current_threshold = base_silence_threshold * 2.5;
+                        }
+
+                        if rms > current_threshold {
                             last_speech_time = std::time::Instant::now();
                             is_speaking = true;
                             sent_eos = false;
@@ -211,23 +231,22 @@ impl TelephonyActionService for TelephonyService {
 
                         if is_speaking || last_speech_time.elapsed() <= silence_timeout {
                             if sdk_rx_tx
-                                .send(sentiric_ai_pipeline_sdk::PipelineInputEvent::Audio(
-                                    res.audio_data,
-                                ))
+                                .send(sentiric_ai_pipeline_sdk::PipelineInputEvent::Audio(res.audio_data))
                                 .await
                                 .is_err()
                             {
                                 break;
                             }
                         } else if !sent_eos {
-                            let _ = sdk_rx_tx
-                                .send(sentiric_ai_pipeline_sdk::PipelineInputEvent::Audio(vec![]))
-                                .await;
+                            let _ = sdk_rx_tx.send(sentiric_ai_pipeline_sdk::PipelineInputEvent::Audio(vec![])).await;
                             sent_eos = true;
                         }
                     }
                 });
 
+                // ----------------------------------------------------
+                // 2. TX TASK (SDK -> Media ve RMQ)
+                // ----------------------------------------------------
                 let (sdk_tx_tx, mut sdk_tx_rx) = mpsc::channel(100);
                 let (media_tx_tx, media_tx_rx) = mpsc::channel(100);
 
@@ -244,48 +263,64 @@ impl TelephonyActionService for TelephonyService {
                 let inner_publisher = publisher_clone.clone();
 
                 tokio::spawn(async move {
-                    while let Some(event) = sdk_tx_rx.recv().await {
-                        match event {
-                            PipelineEvent::Audio(chunk) => {
+                    loop {
+                        // [EKLENDİ]: Media Service 15sn timeout olmasın diye 5sn Timeout Loop eklendi (Keep-Alive)
+                        match tokio::time::timeout(std::time::Duration::from_secs(5), sdk_tx_rx.recv()).await {
+                            Ok(Some(event)) => {
+                                match event {
+                                    PipelineEvent::Audio(chunk) => {
+                                        // [EKLENDİ]: AI Sesi basıyor, timestamp güncelle (Echo Guard için)
+                                        let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+                                        ai_speaking_time_tx.store(now_ms, Ordering::Relaxed);
+
+                                        let msg = StreamAudioToCallRequest {
+                                            call_id: c_id.clone(),
+                                            audio_chunk: chunk,
+                                        };
+                                        if media_tx_tx.send(msg).await.is_err() {
+                                            break;
+                                        }
+                                    }
+                                    // [DÜZELTİLDİ]: Event Schema Mismatch Fix (GenericEvent yerine doğrudan AcousticMoodShiftedEvent)
+                                    PipelineEvent::AcousticMoodShifted { session_id: _evt_sess_id, previous_mood, current_mood, arousal_shift, valence_shift, speaker_id } => {
+                                        use sentiric_contracts::sentiric::event::v1::AcousticMoodShiftedEvent;
+                                        use prost::Message;
+                                        
+                                        let event_msg = AcousticMoodShiftedEvent {
+                                            event_type: "acoustic.mood.shifted".to_string(),
+                                            trace_id: loop_trace_id.clone(),
+                                            call_id: c_id.clone(),
+                                            timestamp: Some(prost_types::Timestamp {
+                                                seconds: chrono::Utc::now().timestamp(),
+                                                nanos: chrono::Utc::now().timestamp_subsec_nanos() as i32,
+                                            }),
+                                            previous_mood,
+                                            current_mood,
+                                            arousal_shift,
+                                            valence_shift,
+                                            speaker_id,
+                                        };
+                                        let mut buf = Vec::new();
+                                        if event_msg.encode(&mut buf).is_ok() {
+                                            inner_publisher.publish_raw("acoustic.mood.shifted", buf).await;
+                                            tracing::info!(event="MOOD_SHIFT_PROPAGATED", trace_id=%loop_trace_id, "Acoustic anomaly detected and published to RMQ.");
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            Ok(None) => break, // Kanal kalıcı kapandı
+                            Err(_) => {
+                                // [EKLENDİ]: Keep-Alive Ping (5 Saniyede bir Media Servise boş paket at)
                                 let msg = StreamAudioToCallRequest {
                                     call_id: c_id.clone(),
-                                    audio_chunk: chunk,
+                                    audio_chunk: vec![], 
                                 };
                                 if media_tx_tx.send(msg).await.is_err() {
-                                    break;
+                                    break; 
                                 }
+                                tracing::debug!(event="MEDIA_STREAM_KEEP_ALIVE", trace_id=%loop_trace_id, "Sent Keep-Alive chunk to Media Service.");
                             }
-                            // [ARCH-COMPLIANCE FIX]: SDK v0.1.16 session_id eklendi
-                            PipelineEvent::AcousticMoodShifted { session_id: evt_sess_id, previous_mood, current_mood, arousal_shift, valence_shift, speaker_id } => {
-                                let payload = serde_json::json!({
-                                    "trace_id": loop_trace_id,
-                                    "session_id": evt_sess_id, // Crystalline için eklendi
-                                    "call_id": c_id,
-                                    "previous_mood": previous_mood,
-                                    "current_mood": current_mood,
-                                    "arousal_shift": arousal_shift,
-                                    "valence_shift": valence_shift,
-                                    "speaker_id": speaker_id
-                                });
-                                use sentiric_contracts::sentiric::event::v1::GenericEvent;
-                                use prost::Message;
-                                let event_msg = GenericEvent {
-                                    event_type: "acoustic.mood.shifted".to_string(),
-                                    trace_id: loop_trace_id.clone(),
-                                    timestamp: Some(prost_types::Timestamp {
-                                        seconds: chrono::Utc::now().timestamp(),
-                                        nanos: chrono::Utc::now().timestamp_subsec_nanos() as i32,
-                                    }),
-                                    tenant_id: loop_tenant_id.clone(),
-                                    payload_json: payload.to_string(),
-                                };
-                                let mut buf = Vec::new();
-                                if event_msg.encode(&mut buf).is_ok() {
-                                    inner_publisher.publish_raw("acoustic.mood.shifted", buf).await;
-                                    tracing::info!(event="MOOD_SHIFT_PROPAGATED", trace_id=%loop_trace_id, "Acoustic anomaly detected and published to RMQ.");
-                                }
-                            }
-                            _ => {}
                         }
                     }
                 });

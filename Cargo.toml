@@ -1,6 +1,6 @@
 [package]
 name = "sentiric-telephony-action-service"
-version = "1.0.23"
+version = "1.0.24"
 edition = "2021"
 authors = ["Sentiric Architecture Team"]
 description = "Telephony Action Service for Sentiric Platform"
