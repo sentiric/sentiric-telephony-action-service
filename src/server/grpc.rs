@@ -187,7 +187,6 @@ impl TelephonyActionService for TelephonyService {
                 let (sdk_rx_tx, sdk_rx_rx) =
                     mpsc::channel::<sentiric_ai_pipeline_sdk::PipelineInputEvent>(100);
 
-                // [EKLENDİ]: Echo Guard (Dynamic VAD) için State Paylaşımı
                 let ai_speaking_time = Arc::new(AtomicU64::new(0));
                 let ai_speaking_time_rx = ai_speaking_time.clone();
                 let ai_speaking_time_tx = ai_speaking_time.clone();
@@ -200,7 +199,9 @@ impl TelephonyActionService for TelephonyService {
                     let mut is_speaking = false;
                     let mut sent_eos = false;
                     let base_silence_threshold = 200.0;
-                    let silence_timeout = std::time::Duration::from_millis(1500);
+                    
+                    // [HIZLANDIRMA UYGULANDI]: 1500ms'den 800ms'ye çekildi. Çok daha akıcı ve hızlı yanıt verecek.
+                    let silence_timeout = std::time::Duration::from_millis(800);
 
                     while let Some(Ok(res)) = record_stream.next().await {
                         let samples: Vec<i16> = res
@@ -211,14 +212,13 @@ impl TelephonyActionService for TelephonyService {
 
                         let rms = TelephonyService::calculate_rms(&samples);
 
-                        // [EKLENDİ]: Dynamic VAD Mantığı (Echo Koruması)
                         let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
                         let last_ai_ms = ai_speaking_time_rx.load(Ordering::Relaxed);
                         
                         let mut current_threshold = base_silence_threshold;
-                        // AI son 1 saniye içinde konuştuysa, mikrofon eşiğini 2.5 katına çıkar (Sağırlaştır)
+                        // AI konuşurken mikrofon 2.5x sağırlaşır (Echo Guard)
                         if now_ms.saturating_sub(last_ai_ms) < 1000 {
-                            current_threshold = base_silence_threshold * 2.5;
+                            current_threshold = base_silence_threshold * 2.5; 
                         }
 
                         if rms > current_threshold {
@@ -264,12 +264,10 @@ impl TelephonyActionService for TelephonyService {
 
                 tokio::spawn(async move {
                     loop {
-                        // [EKLENDİ]: Media Service 15sn timeout olmasın diye 5sn Timeout Loop eklendi (Keep-Alive)
                         match tokio::time::timeout(std::time::Duration::from_secs(5), sdk_tx_rx.recv()).await {
                             Ok(Some(event)) => {
                                 match event {
                                     PipelineEvent::Audio(chunk) => {
-                                        // [EKLENDİ]: AI Sesi basıyor, timestamp güncelle (Echo Guard için)
                                         let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
                                         ai_speaking_time_tx.store(now_ms, Ordering::Relaxed);
 
@@ -281,7 +279,6 @@ impl TelephonyActionService for TelephonyService {
                                             break;
                                         }
                                     }
-                                    // [DÜZELTİLDİ]: Event Schema Mismatch Fix (GenericEvent yerine doğrudan AcousticMoodShiftedEvent)
                                     PipelineEvent::AcousticMoodShifted { session_id: _evt_sess_id, previous_mood, current_mood, arousal_shift, valence_shift, speaker_id } => {
                                         use sentiric_contracts::sentiric::event::v1::AcousticMoodShiftedEvent;
                                         use prost::Message;
@@ -303,15 +300,14 @@ impl TelephonyActionService for TelephonyService {
                                         let mut buf = Vec::new();
                                         if event_msg.encode(&mut buf).is_ok() {
                                             inner_publisher.publish_raw("acoustic.mood.shifted", buf).await;
-                                            tracing::info!(event="MOOD_SHIFT_PROPAGATED", trace_id=%loop_trace_id, "Acoustic anomaly detected and published to RMQ.");
                                         }
                                     }
                                     _ => {}
                                 }
                             }
-                            Ok(None) => break, // Kanal kalıcı kapandı
+                            Ok(None) => break, 
                             Err(_) => {
-                                // [EKLENDİ]: Keep-Alive Ping (5 Saniyede bir Media Servise boş paket at)
+                                // Keep-Alive Ping
                                 let msg = StreamAudioToCallRequest {
                                     call_id: c_id.clone(),
                                     audio_chunk: vec![], 
@@ -319,7 +315,6 @@ impl TelephonyActionService for TelephonyService {
                                 if media_tx_tx.send(msg).await.is_err() {
                                     break; 
                                 }
-                                tracing::debug!(event="MEDIA_STREAM_KEEP_ALIVE", trace_id=%loop_trace_id, "Sent Keep-Alive chunk to Media Service.");
                             }
                         }
                     }
