@@ -291,7 +291,8 @@ impl TelephonyActionService for TelephonyService {
                                         current_mood,
                                         arousal_shift,
                                         valence_shift,
-                                        speaker_id
+                                        speaker_id,
+                                        speaker_vec // [YENİ]: SDK'dan gelen biyometrik veriyi al
                                     } => {
                                         use sentiric_contracts::sentiric::event::v1::AcousticMoodShiftedEvent;
                                         use prost::Message;
@@ -309,7 +310,7 @@ impl TelephonyActionService for TelephonyService {
                                             arousal_shift,
                                             valence_shift,
                                             speaker_id,
-                                            speaker_vec: vec![], // [FIX]: build hatasını gidermek için şimdilik boş vec.
+                                            speaker_vec, // [FIX]: Boş vektör silindi, gerçek veri eklendi!
                                         };
 
                                         let mut buf = Vec::new();

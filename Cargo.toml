@@ -1,6 +1,6 @@
 [package]
 name = "sentiric-telephony-action-service"
-version = "1.0.30"
+version = "1.0.31"
 edition = "2021"
 authors = ["Sentiric Architecture Team"]
 description = "Telephony Action Service for Sentiric Platform"
@@ -28,4 +28,4 @@ anyhow = "1.0"
 lapin = "2.3"
 
 sentiric-contracts = { git = "https://github.com/sentiric/sentiric-contracts.git", tag = "v1.21.1" }
-sentiric-ai-pipeline-sdk = { git = "https://github.com/sentiric/sentiric-ai-pipeline-sdk.git", tag = "v0.1.20" }
+sentiric-ai-pipeline-sdk = { git = "https://github.com/sentiric/sentiric-ai-pipeline-sdk.git", tag = "v0.1.21" }
