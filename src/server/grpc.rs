@@ -284,9 +284,18 @@ impl TelephonyActionService for TelephonyService {
                                             break;
                                         }
                                     }
-                                    PipelineEvent::AcousticMoodShifted { session_id: _evt_sess_id, previous_mood, current_mood, arousal_shift, valence_shift, speaker_id } => {
+                                    // ✅ GÜNCELLENMİŞ BLOK (src/server/grpc.rs)
+                                    PipelineEvent::AcousticMoodShifted {
+                                        session_id: _evt_sess_id,
+                                        previous_mood,
+                                        current_mood,
+                                        arousal_shift,
+                                        valence_shift,
+                                        speaker_id
+                                    } => {
                                         use sentiric_contracts::sentiric::event::v1::AcousticMoodShiftedEvent;
                                         use prost::Message;
+
                                         let event_msg = AcousticMoodShiftedEvent {
                                             event_type: "acoustic.mood.shifted".to_string(),
                                             trace_id: loop_trace_id.clone(),
@@ -300,7 +309,9 @@ impl TelephonyActionService for TelephonyService {
                                             arousal_shift,
                                             valence_shift,
                                             speaker_id,
+                                            speaker_vec: vec![], // [FIX]: build hatasını gidermek için şimdilik boş vec.
                                         };
+
                                         let mut buf = Vec::new();
                                         if event_msg.encode(&mut buf).is_ok() {
                                             inner_publisher.publish_raw("acoustic.mood.shifted", buf).await;
